@@ -1,0 +1,19 @@
+# Same shape as birdlisten's: keep the image small, build cache stable.
+.git
+.github
+.venv
+__pycache__
+*.pyc
+.env
+.env.*
+*.md
+docs/
+tests/
+test_*.py
+*_test.py
+.pytest_cache
+Dockerfile
+compose.yaml
+.dockerignore
+.gitignore
+models/
