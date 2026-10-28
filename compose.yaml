@@ -1,0 +1,28 @@
+# For running package-detector on a dev laptop exactly as the fleet runs it.
+#
+#   cp .env.example .env && $EDITOR .env
+#   docker compose run --rm -e LOOP_ONCE=1 -e RUN_ARGS="--check" app    # config + ffmpeg + cameras, no writes
+#   docker compose run --rm -e LOOP_ONCE=1 -e RUN_ARGS="--dry-run" app  # one real poll, prints HA payload, writes nothing
+#   docker compose run --rm -e LOOP_ONCE=1 app                          # one real poll
+#   docker compose up                                                    # the real loop
+#
+# Not used by the fleet host; it has its own compose.yaml listing every app.
+# The model is mounted, not committed: put package.onnx in ./models/ locally.
+services:
+  app:
+    build: .
+    image: ghcr.io/joekraemer/package-detector:dev
+    env_file: .env
+    environment:
+      PYTHONUNBUFFERED: "1"
+      # loop.py sleeps this long between polls; POLL_INTERVAL_SECONDS in
+      # .env is the app's own view of the same number. Keep them equal.
+      LOOP_INTERVAL: "15"
+      LOOP_JITTER: "0"
+    volumes:
+      - package-detector-data:/data
+      - ./models:/models:ro
+    restart: "no"
+
+volumes:
+  package-detector-data:
