@@ -323,5 +323,6 @@ Divergences from birdlisten, on purpose:
 | `Dockerfile`, `compose.yaml`, `.env.example` | dev-laptop run, same shape as birdlisten |
 | `pyproject.toml`, `uv.lock` | uv environment (fleet app contract, issue #5); `uv.lock` is committed and frozen in the image build |
 | `docs/MODEL.md` | model + dataset + evaluation plan |
+| `docs/LABELLING.md` | labelling workflow, retention rule, retrain trigger (issue #4) |
 | `tests/` | stdlib unittest: config, zones, state machine, HA payload — no camera, no model, no network |
 | `verification-capture.sh` | issue #2 capture tool: one snapshot per camera per round, host-only log, no credentials logged |
