@@ -1,0 +1,20 @@
+[project]
+name = "package-detector"
+version = "0.1.0"
+description = "Poll Reolink cameras, detect packages with YOLO11n ONNX, and flip a Home Assistant sensor per camera"
+# 3.12, not birdlisten's 3.11: onnxruntime ships 3.12 wheels, and there is
+# no tflite pin holding this project back. The fleet host is Intel amd64,
+# so no platform-specific deps are needed.
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    # Runtime only. No torch, no ultralytics: inference is ONNX Runtime
+    # on CPU. Training uses its own environment (docs/MODEL.md) and is
+    # never installed here. Pinned so uv.lock is the only moving part.
+    "onnxruntime==1.22.0",
+    "numpy==2.2.6",
+    "Pillow==11.3.0",
+    "requests==2.32.4",
+]
+
+[tool.uv]
+package = false
