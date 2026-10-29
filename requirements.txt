@@ -1,6 +1,0 @@
-# Runtime only. No torch, no ultralytics: inference is ONNX Runtime on CPU.
-# Training uses its own environment (docs/MODEL.md) and is never installed here.
-onnxruntime==1.22.0
-numpy==2.2.6
-Pillow==11.3.0
-requests==2.32.4
