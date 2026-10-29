@@ -148,8 +148,8 @@ the exit code.
 
 | var | default | meaning |
 |---|---|---|
-| `CAMERAS` | — (required) | `name=rtsp-url` pairs, comma separated, same format as birdlisten |
-| `POLL_INTERVAL_SECONDS` | `15` | seconds between polls, 15..900. 15 is the default; raise it if the host or NVR struggles |
+| `CAMERAS` | — (required) | `name=rtsp-url` pairs, comma separated, same format as birdlisten. Names: lowercase letters, digits, `_` (each becomes `binary_sensor.package_<name>`) |
+| `POLL_INTERVAL_SECONDS` | `15` | seconds between polls, 15..900. 15 is the default; raise it if the host or NVR struggles. `loop.py` sleeps this long (a `LOOP_INTERVAL` env var overrides it) |
 | `MODEL_PATH` | `/models/package.onnx` | YOLO11n ONNX model, single `package` class. Mounted, not committed (see Model) |
 | `CONFIDENCE` | `0.5` | detection confidence bar, 0..1. Start here, tune from evidence (see Tuning) |
 | `CONFIRM_HITS` | `2` | consecutive polls with a detection before a camera flips to present (~30 s at 15 s polls) |
@@ -157,6 +157,7 @@ the exit code.
 | `ZONES` | (unset = full frame) | per-camera rectangle, `porch=0,0.5,1,1` = x_min,y_min,x_max,y_max as fractions of the frame. Only detections whose centre falls inside count |
 | `HA_URL` | — (required for live runs) | Home Assistant base URL, e.g. `http://homeassistant.local:8123` |
 | `HA_TOKEN` | — (required for live runs) | HA long-lived access token. Secret: fleet env file only, never committed |
+| `HA_REFRESH_SECONDS` | `300` | re-send each sensor's current state this often (60..3600), plus after any failed POST |
 | `DATA_DIR` | `/data` | SQLite db + evidence snapshots |
 | `SNAPSHOT_TIMEOUT_S` | `15` | ffmpeg snapshot timeout per camera |
 | `TZ` | `America/Los_Angeles` | timestamps |
@@ -177,10 +178,13 @@ convention as birdlisten. `--check` and `--dry-run` do not need
      boxy for a second) must not flip the sensor;
    - absent requires `CLEAR_MISSES` consecutive misses — one dark or
      blurred frame must not clear a real package.
-5. Only on a state **change** does it write to HA and save an annotated
+5. On a state **change** it writes to HA and saves an annotated
    evidence snapshot under `/data/evidence/YYYY-MM-DD/<camera>_<time>.jpg`.
-   Steady state writes nothing to HA beyond the poll log row, so HA
-   history is not spammed every poll.
+   Between changes it re-sends the current state every
+   `HA_REFRESH_SECONDS` (default 5 min), and on the next poll after a
+   failed POST. States set through HA's REST API are lost when HA
+   restarts, so without this the sensor would vanish, or stay wrong
+   after one failed POST, until the next package arrived or left.
 6. Every poll appends one row per camera to SQLite (`polls`), so tuning
    later has real data: timestamp, camera, detection yes/no, best
    confidence, state after the poll.
@@ -319,7 +323,7 @@ Divergences from birdlisten, on purpose:
 | file | what it is |
 |---|---|
 | `packagedetector.py` | the whole service: config, capture, inference, state, storage, HA |
-| `loop.py` | container PID 1: runs one poll, sleeps `LOOP_INTERVAL`, repeats; `LOOP_ONCE=1` runs once (birdlisten pattern) |
+| `loop.py` | container PID 1: runs one poll, sleeps `POLL_INTERVAL_SECONDS` (or `LOOP_INTERVAL`), repeats; `LOOP_ONCE=1` runs once (birdlisten pattern) |
 | `Dockerfile`, `compose.yaml`, `.env.example` | dev-laptop run, same shape as birdlisten |
 | `pyproject.toml`, `uv.lock` | uv environment (fleet app contract, issue #5); `uv.lock` is committed and frozen in the image build |
 | `docs/MODEL.md` | model + dataset + evaluation plan |

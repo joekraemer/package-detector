@@ -23,6 +23,7 @@ import argparse
 import json
 import logging
 import os
+import re
 import shutil
 import sqlite3
 import subprocess
@@ -37,6 +38,17 @@ logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
 MODEL_INPUT = 640  # YOLO11n ONNX input size (square, letterboxed)
+# Camera names become part of a Home Assistant entity id
+# (binary_sensor.package_<name>), which allows only these characters.
+CAMERA_NAME_RE = re.compile(r"^[a-z0-9_]+$")
+_URL_CREDENTIALS_RE = re.compile(r"(?i)\b(rtsps?://)[^/\s@]*@")
+
+
+def redact_url(text: str) -> str:
+    """Hide user:password in any rtsp:// URL inside `text`. ffmpeg's error
+    lines start with the input URL, and those lines reach the container log,
+    which fleet's health check copies into GitHub issues."""
+    return _URL_CREDENTIALS_RE.sub(r"\1***@", text)
 
 
 class ConfigError(Exception):
@@ -62,6 +74,7 @@ class Config:
     ha_token: str = ""
     data_dir: str = "/data"
     snapshot_timeout_s: int = 15
+    ha_refresh_seconds: int = 300
 
 
 def parse_cameras(value: str) -> list[Camera]:
@@ -72,13 +85,17 @@ def parse_cameras(value: str) -> list[Camera]:
         if not part:
             continue
         if "=" not in part:
-            raise ConfigError(f"CAMERAS entry has no '=': {part!r}")
+            raise ConfigError(f"CAMERAS entry has no '=': {redact_url(part)!r}")
         name, url = part.split("=", 1)
         name, url = name.strip(), url.strip()
         if not name or not url:
-            raise ConfigError(f"CAMERAS entry is incomplete: {part!r}")
+            raise ConfigError(f"CAMERAS entry is incomplete: {redact_url(part)!r}")
+        if not CAMERA_NAME_RE.match(name):
+            raise ConfigError(f"camera name {name!r} must be lowercase letters, digits or _ "
+                              "(it becomes binary_sensor.package_<name> in Home Assistant)")
         if not url.startswith("rtsp://"):
-            raise ConfigError(f"camera {name}: URL must be rtsp://, got {url[:20]!r}")
+            scheme = url.split("://", 1)[0] if "://" in url else url[:8]
+            raise ConfigError(f"camera {name}: URL must be rtsp://, got {scheme!r}://...")
         cameras.append(Camera(name, url))
     if not cameras:
         raise ConfigError("CAMERAS is empty")
@@ -160,6 +177,7 @@ def load_config(env: dict | None = None, require_ha: bool = False) -> Config:
         ha_token=env.get("HA_TOKEN", ""),
         data_dir=env.get("DATA_DIR", "/data"),
         snapshot_timeout_s=_env_int(env, "SNAPSHOT_TIMEOUT_S", 15, 3, 120),
+        ha_refresh_seconds=_env_int(env, "HA_REFRESH_SECONDS", 300, 60, 3600),
     )
     if require_ha and (not cfg.ha_url or not cfg.ha_token):
         raise ConfigError("live run needs HA_URL and HA_TOKEN (not needed for --check/--dry-run)")
@@ -202,7 +220,8 @@ def update_state(present: bool, hits: int, misses: int, detected: bool,
 
 def capture_snapshot(url: str, timeout_s: int) -> tuple[str | None, str]:
     """One frame via ffmpeg from the RTSP sub-stream. Returns
-    (temp JPEG path, error string). Caller deletes the file."""
+    (temp JPEG path, error string). On success the caller deletes the
+    file; on failure it is already gone. Errors never contain credentials."""
     if shutil.which("ffmpeg") is None:
         return None, "ffmpeg not found"
     tmp = tempfile.NamedTemporaryFile(suffix=".jpg", delete=False)
@@ -210,17 +229,28 @@ def capture_snapshot(url: str, timeout_s: int) -> tuple[str | None, str]:
     cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error",
            "-rtsp_transport", "tcp", "-i", url,
            "-frames:v", "1", "-q:v", "2", "-y", tmp.name]
+    err = ""
     try:
         subprocess.run(cmd, timeout=timeout_s, check=True,
                        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        if os.path.getsize(tmp.name) == 0:
+            err = "ffmpeg produced an empty frame"
     except subprocess.TimeoutExpired:
-        return None, f"ffmpeg timed out after {timeout_s}s"
+        err = f"ffmpeg timed out after {timeout_s}s"
     except subprocess.CalledProcessError as exc:
         detail = exc.stderr.decode(errors="replace").strip().splitlines()
-        return None, "ffmpeg failed: " + (detail[-1] if detail else "unknown error")
-    if os.path.getsize(tmp.name) == 0:
-        return None, "ffmpeg produced an empty frame"
+        err = "ffmpeg failed: " + redact_url(detail[-1] if detail else "unknown error")
+    if err:
+        _remove(tmp.name)
+        return None, err
     return tmp.name, ""
+
+
+def _remove(path: str) -> None:
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
 
 
 # ---------------------------------------------------------------- inference
@@ -245,9 +275,48 @@ def _nms(boxes: list, scores: list, iou_thresh: float = 0.45) -> list[int]:
     return keep
 
 
+def letterbox_params(orig_w: int, orig_h: int, size: int = MODEL_INPUT) -> tuple[float, int, int]:
+    """(scale, pad_x, pad_y) used to fit the frame into a size x size canvas,
+    centred, the way detect() and Ultralytics do it."""
+    scale = min(size / orig_w, size / orig_h)
+    nw, nh = int(orig_w * scale), int(orig_h * scale)
+    return scale, (size - nw) // 2, (size - nh) // 2
+
+
+def model_box_to_frame(cx: float, cy: float, w: float, h: float, orig_w: int, orig_h: int,
+                       size: int = MODEL_INPUT) -> tuple[float, float, float, float]:
+    """Map a (cx, cy, w, h) box in letterboxed-canvas pixels back to
+    (x1, y1, x2, y2) as fractions of the ORIGINAL frame, clipped to 0..1.
+    Without removing the padding, a 16:9 frame's top edge comes out at
+    y~0.22 and its bottom at y~0.78, which breaks zones and evidence boxes."""
+    scale, pad_x, pad_y = letterbox_params(orig_w, orig_h, size)
+
+    def fx(v: float) -> float:
+        return min(max((v - pad_x) / scale / orig_w, 0.0), 1.0)
+
+    def fy(v: float) -> float:
+        return min(max((v - pad_y) / scale / orig_h, 0.0), 1.0)
+
+    return fx(cx - w / 2), fy(cy - h / 2), fx(cx + w / 2), fy(cy + h / 2)
+
+
+_sessions: dict[tuple[str, float], object] = {}
+
+
+def _session(model_path: str):
+    """One ONNX Runtime session per model file, reused across cameras and
+    polls (loop.py keeps this process alive). A new file mtime reloads it."""
+    import onnxruntime as ort
+    key = (model_path, os.path.getmtime(model_path))
+    if key not in _sessions:
+        _sessions.clear()
+        _sessions[key] = ort.InferenceSession(model_path, providers=["CPUExecutionProvider"])
+    return _sessions[key]
+
+
 def detect(image_path: str, model_path: str, confidence: float) -> list[dict]:
     """Run the ONNX model on one JPEG. Returns detections as
-    {box: (x1,y1,x2,y2) normalised 0..1, confidence}.
+    {box: (x1,y1,x2,y2) normalised 0..1 of the original frame, confidence}.
 
     Assumes an Ultralytics-style export: one output, rows of
     (cx, cy, w, h, class scores...), single class `package`.
@@ -256,20 +325,19 @@ def detect(image_path: str, model_path: str, confidence: float) -> list[dict]:
     before trusting any detection.
     """
     import numpy as np
-    import onnxruntime as ort
     from PIL import Image
 
     with Image.open(image_path) as im:
         im = im.convert("RGB")
         orig_w, orig_h = im.size
         # Letterbox to square MODEL_INPUT, as Ultralytics does.
-        scale = min(MODEL_INPUT / orig_w, MODEL_INPUT / orig_h)
+        scale, pad_x, pad_y = letterbox_params(orig_w, orig_h)
         nw, nh = int(orig_w * scale), int(orig_h * scale)
         canvas = Image.new("RGB", (MODEL_INPUT, MODEL_INPUT), (114, 114, 114))
-        canvas.paste(im.resize((nw, nh)), ((MODEL_INPUT - nw) // 2, (MODEL_INPUT - nh) // 2))
+        canvas.paste(im.resize((nw, nh)), (pad_x, pad_y))
         arr = np.asarray(canvas, dtype=np.float32) / 255.0
         arr = arr.transpose(2, 0, 1)[None, :, :, :]
-    session = ort.InferenceSession(model_path, providers=["CPUExecutionProvider"])
+    session = _session(model_path)
     out = session.run(None, {session.get_inputs()[0].name: arr})[0]
     out = np.asarray(out)
     if out.ndim == 3:
@@ -284,8 +352,7 @@ def detect(image_path: str, model_path: str, confidence: float) -> list[dict]:
         score = float(np.max(row[4:]))
         if score < confidence:
             continue
-        boxes.append(( (cx - w / 2) / MODEL_INPUT, (cy - h / 2) / MODEL_INPUT,
-                       (cx + w / 2) / MODEL_INPUT, (cy + h / 2) / MODEL_INPUT ))
+        boxes.append(model_box_to_frame(cx, cy, w, h, orig_w, orig_h))
         scores.append(score)
     result = [{"box": boxes[i], "confidence": scores[i]} for i in _nms(boxes, scores)]
     return result
@@ -320,14 +387,50 @@ def init_db(data_dir: str) -> sqlite3.Connection:
     conn.execute("""CREATE TABLE IF NOT EXISTS camera_state (
         camera TEXT PRIMARY KEY, present INTEGER, hits INTEGER, misses INTEGER,
         last_seen TEXT, since TEXT)""")
+    # Added later; older databases get them here. ha_synced: did the last
+    # POST of this camera's state succeed. ha_posted: epoch of that POST.
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(camera_state)")}
+    if "ha_synced" not in cols:
+        conn.execute("ALTER TABLE camera_state ADD COLUMN ha_synced INTEGER DEFAULT 0")
+    if "ha_posted" not in cols:
+        conn.execute("ALTER TABLE camera_state ADD COLUMN ha_posted REAL")
     conn.commit()
     return conn
 
 
-def load_state(conn: sqlite3.Connection, camera: str) -> tuple[bool, int, int]:
-    row = conn.execute("SELECT present, hits, misses FROM camera_state WHERE camera=?",
-                       (camera,)).fetchone()
-    return (bool(row[0]), row[1], row[2]) if row else (False, 0, 0)
+@dataclass
+class CamState:
+    present: bool = False
+    hits: int = 0
+    misses: int = 0
+    last_seen: str | None = None   # last poll with a detection
+    since: str | None = None       # when `present` last changed
+    ha_synced: bool = False
+    ha_posted: float | None = None
+
+
+def load_state(conn: sqlite3.Connection, camera: str) -> CamState:
+    row = conn.execute("""SELECT present, hits, misses, last_seen, since, ha_synced, ha_posted
+                          FROM camera_state WHERE camera=?""", (camera,)).fetchone()
+    if not row:
+        return CamState()
+    return CamState(bool(row[0]), row[1], row[2], row[3], row[4], bool(row[5]), row[6])
+
+
+def save_state(conn: sqlite3.Connection, camera: str, s: CamState) -> None:
+    conn.execute("""INSERT OR REPLACE INTO camera_state
+                    (camera, present, hits, misses, last_seen, since, ha_synced, ha_posted)
+                    VALUES (?,?,?,?,?,?,?,?)""",
+                 (camera, int(s.present), s.hits, s.misses, s.last_seen, s.since,
+                  int(s.ha_synced), s.ha_posted))
+
+
+def needs_ha_post(changed: bool, synced: bool, last_post: float | None, now: float,
+                  refresh_s: int) -> bool:
+    """POST on a state change, after a failed POST, and every `refresh_s`
+    regardless. States set through HA's REST API vanish when HA restarts,
+    and a failed POST would otherwise leave HA wrong until the next change."""
+    return changed or not synced or last_post is None or now - last_post >= refresh_s
 
 
 # ---------------------------------------------------------------- Home Assistant
@@ -375,57 +478,66 @@ def poll_once(cfg: Config, dry_run: bool = False) -> int:
             rc = 1
             continue
         try:
-            detections = detect(snap, cfg.model_path, cfg.confidence) if model_ok else []
-        except Exception:  # noqa: BLE001 — one bad inference must not kill the poll
-            log.error("camera %s: inference failed", cam.name, exc_info=True)
-            rc = 1
-            continue
-        kept = [d for d in detections
-                if zone_contains(cfg.zones.get(cam.name), d["box"])]
-        detected = bool(kept)
-        best = max((d["confidence"] for d in kept), default=None)
-        log.info("camera %s: detected=%s best=%.2f kept=%d raw=%d",
-                 cam.name, detected, best or 0.0, len(kept), len(detections))
-        if dry_run:
-            if cfg.ha_url:
-                log.info("dry-run HA payload for %s: %s",
-                         cam.name, json.dumps(ha_payload(cam.name, detected, best, now)))
-            continue
-        assert conn is not None
-        present, hits, misses = load_state(conn, cam.name)
-        new_present, hits, misses = update_state(present, hits, misses, detected,
-                                                 cfg.confirm_hits, cfg.clear_misses)[:3]
-        changed = new_present != present
-        conn.execute("INSERT INTO polls VALUES (?,?,?,?,?)",
-                     (now, cam.name, int(detected), best, int(new_present)))
-        conn.execute("""INSERT INTO camera_state VALUES (?,?,?,?,?,?)
-                        ON CONFLICT(camera) DO UPDATE SET present=excluded.present,
-                        hits=excluded.hits, misses=excluded.misses,
-                        last_seen=excluded.last_seen, since=excluded.since""",
-                     (cam.name, int(new_present), hits, misses,
-                      now if detected else None,
-                      now if changed and new_present else None))
-        conn.commit()
-        if changed:
-            day = datetime.now().strftime("%Y-%m-%d")
-            ev_dir = os.path.join(cfg.data_dir, "evidence", day)
-            os.makedirs(ev_dir, exist_ok=True)
-            ev = os.path.join(ev_dir, f"{cam.name}_{int(time.time())}.jpg")
-            annotate(snap, kept, ev)
-            err = post_to_ha(cfg, cam.name, new_present, best, now if detected else None)
-            if err:
-                log.error("camera %s: %s", cam.name, err)
-                rc = 1
-            else:
-                log.info("camera %s: state %s -> %s, HA updated, evidence %s",
-                         cam.name, present, new_present, ev)
-        # capture_snapshot used a temp file: remove it now that we are done.
-        try:
-            os.unlink(snap)
-        except OSError:
-            pass
+            rc |= _poll_camera(cfg, conn, cam, snap, model_ok, now, dry_run)
+        finally:
+            # capture_snapshot used a temp file: remove it on every path.
+            _remove(snap)
     if conn is not None:
         conn.close()
+    return rc
+
+
+def _poll_camera(cfg: Config, conn: sqlite3.Connection | None, cam: Camera, snap: str,
+                 model_ok: bool, now: str, dry_run: bool) -> int:
+    try:
+        detections = detect(snap, cfg.model_path, cfg.confidence) if model_ok else []
+    except Exception:  # noqa: BLE001 — one bad inference must not kill the poll
+        log.error("camera %s: inference failed", cam.name, exc_info=True)
+        return 1
+    kept = [d for d in detections
+            if zone_contains(cfg.zones.get(cam.name), d["box"])]
+    detected = bool(kept)
+    best = max((d["confidence"] for d in kept), default=None)
+    log.info("camera %s: detected=%s best=%.2f kept=%d raw=%d",
+             cam.name, detected, best or 0.0, len(kept), len(detections))
+    if dry_run:
+        if cfg.ha_url:
+            log.info("dry-run HA payload for %s: %s",
+                     cam.name, json.dumps(ha_payload(cam.name, detected, best, now)))
+        return 0
+    assert conn is not None
+    s = load_state(conn, cam.name)
+    new_present, s.hits, s.misses, changed = update_state(
+        s.present, s.hits, s.misses, detected, cfg.confirm_hits, cfg.clear_misses)
+    old_present, s.present = s.present, new_present
+    if detected:
+        s.last_seen = now
+    if changed or s.since is None:
+        s.since = now
+    conn.execute("INSERT INTO polls VALUES (?,?,?,?,?)",
+                 (now, cam.name, int(detected), best, int(new_present)))
+    rc = 0
+    ev = None
+    if changed:
+        day = datetime.now().strftime("%Y-%m-%d")
+        ev_dir = os.path.join(cfg.data_dir, "evidence", day)
+        os.makedirs(ev_dir, exist_ok=True)
+        ev = os.path.join(ev_dir, f"{cam.name}_{int(time.time())}.jpg")
+        annotate(snap, kept, ev)
+    epoch = time.time()
+    if needs_ha_post(changed, s.ha_synced, s.ha_posted, epoch, cfg.ha_refresh_seconds):
+        err = post_to_ha(cfg, cam.name, new_present, best, s.last_seen)
+        s.ha_synced = not err
+        if err:
+            log.error("camera %s: %s (will retry next poll)", cam.name, err)
+            rc = 1
+        else:
+            s.ha_posted = epoch
+            if changed:
+                log.info("camera %s: state %s -> %s, HA updated, evidence %s",
+                         cam.name, old_present, new_present, ev)
+    save_state(conn, cam.name, s)
+    conn.commit()
     return rc
 
 

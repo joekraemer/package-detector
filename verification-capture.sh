@@ -27,6 +27,8 @@ LOG=verification/capture.log
 
 # Strip credentials for logging: rtsp://user:pass@host:port/... -> host
 host_of() { printf '%s' "$1" | sed -E 's#^rtsp://[^@]*@##; s#/.*$##'; }
+# ffmpeg's error lines start with the input URL, password included.
+redact() { sed -E 's#(rtsps?://)[^/[:space:]@]*@#\1***@#g'; }
 
 round=1
 while [ "$round" -le "$ROUNDS" ]; do
@@ -43,7 +45,7 @@ while [ "$round" -le "$ROUNDS" ]; do
       echo "$stamp round=$round camera=$name host=$(host_of "$url") ok bytes=$bytes secs=$(( $(date +%s) - start ))" >> "$LOG"
     else
       rm -f "$out"
-      echo "$stamp round=$round camera=$name host=$(host_of "$url") FAIL $(tail -1 /tmp/pd-cap.err 2>/dev/null)" >> "$LOG"
+      echo "$stamp round=$round camera=$name host=$(host_of "$url") FAIL $(tail -1 /tmp/pd-cap.err 2>/dev/null | redact)" >> "$LOG"
     fi
   done
   round=$((round + 1))
