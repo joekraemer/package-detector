@@ -110,12 +110,16 @@ looking at, not a crash.
    ```
 3. Fleet: on the host, create `~/.config/fleet/package-detector.env`
    with the same content as `.env`. Then in `fleet/compose.yaml`
-   uncomment/add the `package-detector` service (same shape as
-   `birdlisten`: image `ghcr.io/joekraemer/package-detector:main`,
-   `env_file`, a volume at `/data`, `restart: unless-stopped`), push
-   fleet. Pushes to this repo's `main` build and publish the image to
-   GHCR (see [Deploy](#deploy)); the fleet host pulling that tag is
-   what deploys it.
+   add a `package-detector` service (no block exists there yet — a
+   2026-10-29 read-only audit of the fleet repo confirmed this; same
+   shape as `birdlisten`: image
+   `ghcr.io/joekraemer/package-detector:main`, `env_file`, a volume
+   at `/data`, `restart: unless-stopped`), push fleet. Once the build
+   workflow in [Deploy](#deploy) is in place, pushes to this repo's
+   `main` build and publish the image to GHCR; the fleet host pulling
+   that tag is what deploys it. The fleet repo itself is private, so
+   its self-hosted health runner is not exposed to public pull
+   requests.
 
 ## Config
 
@@ -153,7 +157,7 @@ convention as birdlisten. `--check` and `--dry-run` do not need
 5. Only on a state **change** does it write to HA and save an annotated
    evidence snapshot under `/data/evidence/YYYY-MM-DD/<camera>_<time>.jpg`.
    Steady state writes nothing to HA beyond the poll log row, so HA
-   history is not spammed every 3 minutes.
+   history is not spammed every poll.
 6. Every poll appends one row per camera to SQLite (`polls`), so tuning
    later has real data: timestamp, camera, detection yes/no, best
    confidence, state after the poll.
@@ -206,7 +210,7 @@ issue #6 if you want it as an option.
 Design target: **YOLO11n, ONNX, CPU-only, single class `package`**.
 YOLO11n is 2.6M parameters; published CPU ONNX speed is ~56 ms per
 640 px image on a server-class CPU (your host will be slower, but at
-one frame per camera per 3 minutes, even 10x slower is nothing).
+one frame per camera every 15 seconds, even 10x slower is nothing).
 The runtime image therefore carries **onnxruntime only — no PyTorch,
 no Ultralytics**. Training (Ultralytics + PyTorch) is a separate,
 offline tool, never in the deployed image; that is what keeps the
@@ -242,12 +246,18 @@ mistakes, retrain, repeat.
 
 ## Deploy
 
-`.github/workflows/build.yml` mirrors birdlisten's: on push to `main`
-it builds `linux/amd64` and publishes
+`.github/workflows/build.yml` is intended to mirror birdlisten's: on
+push to `main` it builds `linux/amd64` and publishes
 `ghcr.io/joekraemer/package-detector:main` plus a `:sha-<short>` tag
 for pinning back a bad release, then smoke-tests the image
 (`--help` must work). "Push to main IS the deploy" — the fleet host
 pulls `:main` on its own schedule.
+
+That workflow file is **not in this repo yet** (issue #7 — it could
+not be pushed via the GitHub integration, which needs a separate
+workflow permission, so it must be added via the GitHub web UI or a
+local git push). Until it lands, no GHCR image is published and a
+fleet service block would have nothing to pull.
 
 Divergences from birdlisten, on purpose:
 
@@ -255,12 +265,15 @@ Divergences from birdlisten, on purpose:
 - **pip + pinned `requirements.txt`, not uv + `uv.lock`.** uv was not
   available where this scaffold was written, and a hand-written lockfile
   would be worse than an honest pinned requirements file. Migrating to
-  uv to match birdlisten exactly is issue #7.
+  uv to match the fleet app contract is part of issue #5 (fleet deploy
+  prep), not issue #7.
 - **No web UI in v1.** birdlisten's collage page earns its keep because
   there is something to look at. Here the HA sensor is the UI; the
-  evidence snapshots are files, not a page. A status page is issue #8.
+  evidence snapshots are files, not a page. A status page is part of
+  issue #6 (optional outputs).
 - **amd64 only**, same as birdlisten (the fleet host is Intel). If the
-  home-lab host is ARM, add `linux/arm64` to the workflow — issue #9.
+  home-lab host is ever ARM, add `linux/arm64` to the workflow — no
+  issue filed for that yet.
 
 ## Tuning
 
