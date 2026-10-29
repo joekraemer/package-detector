@@ -121,6 +121,28 @@ looking at, not a crash.
    its self-hosted health runner is not exposed to public pull
    requests.
 
+## Verifying cameras (issue #2)
+
+This step runs on the LAN, next to the cameras — not from a remote
+agent, which cannot reach them. `verification-capture.sh` reads
+`CAMERAS` from `.env`, grabs one ffmpeg snapshot per camera, and saves
+them timestamped under `verification/`, with a log that records only
+the camera host, never the user or password.
+
+```text
+bash verification-capture.sh          # one round, now
+bash verification-capture.sh 40 15    # churn test: 40 rounds, 15 s apart (~10 min)
+```
+
+Check `verification/capture.log` for failures. A `453` refusal or a
+run of timeouts during the churn test means the NVR is unhappy with
+15-second session churn (see issue #2) — that verdict, plus snapshots
+at day, dusk, and night/IR, empty and with a staged box/mailer where
+deliveries actually land, are what set the per-camera zones. Note:
+`--check` reports "model not found" and exits 1 until issue #1 lands;
+for camera verification, the snapshot OK lines are the signal, not
+the exit code.
+
 ## Config
 
 | var | default | meaning |
@@ -299,3 +321,4 @@ Divergences from birdlisten, on purpose:
 | `Dockerfile`, `compose.yaml`, `.env.example` | dev-laptop run, same shape as birdlisten |
 | `docs/MODEL.md` | model + dataset + evaluation plan |
 | `tests/` | stdlib unittest: config, zones, state machine, HA payload — no camera, no model, no network |
+| `verification-capture.sh` | issue #2 capture tool: one snapshot per camera per round, host-only log, no credentials logged |
