@@ -284,11 +284,12 @@ fleet service block would have nothing to pull.
 Divergences from birdlisten, on purpose:
 
 - **Polling, not streaming** (see above).
-- **pip + pinned `requirements.txt`, not uv + `uv.lock`.** uv was not
-  available where this scaffold was written, and a hand-written lockfile
-  would be worse than an honest pinned requirements file. Migrating to
-  uv to match the fleet app contract is part of issue #5 (fleet deploy
-  prep), not issue #7.
+- **uv + `uv.lock`, not pip + `requirements.txt`.** The scaffold
+  started on pip because uv was not available where it was written;
+  this was migrated to match the fleet app contract (issue #5) and
+  birdlisten exactly: `pyproject.toml` with `[tool.uv] package = false`,
+  Python 3.12 (not birdlisten's tflite-pinned 3.11), uv 0.11 in the
+  Dockerfile, `uv sync --frozen --no-dev --no-install-project`.
 - **No web UI in v1.** birdlisten's collage page earns its keep because
   there is something to look at. Here the HA sensor is the UI; the
   evidence snapshots are files, not a page. A status page is part of
@@ -319,6 +320,7 @@ Divergences from birdlisten, on purpose:
 | `packagedetector.py` | the whole service: config, capture, inference, state, storage, HA |
 | `loop.py` | container PID 1: runs one poll, sleeps `LOOP_INTERVAL`, repeats; `LOOP_ONCE=1` runs once (birdlisten pattern) |
 | `Dockerfile`, `compose.yaml`, `.env.example` | dev-laptop run, same shape as birdlisten |
+| `pyproject.toml`, `uv.lock` | uv environment (fleet app contract, issue #5); `uv.lock` is committed and frozen in the image build |
 | `docs/MODEL.md` | model + dataset + evaluation plan |
 | `tests/` | stdlib unittest: config, zones, state machine, HA payload — no camera, no model, no network |
 | `verification-capture.sh` | issue #2 capture tool: one snapshot per camera per round, host-only log, no credentials logged |
