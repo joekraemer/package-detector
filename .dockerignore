@@ -8,7 +8,6 @@ __pycache__
 .env.*
 *.md
 docs/
-tests/
 test_*.py
 *_test.py
 .pytest_cache
@@ -17,3 +16,9 @@ compose.yaml
 .dockerignore
 .gitignore
 models/
+# Exception: the workflow's Unit tests step runs `python -m unittest
+# discover -s tests` INSIDE the built image (see .github/workflows/build.yml).
+# Excluding tests/ broke that step with "Start directory is not
+# importable: 'tests'" (issue #12). The test file is stdlib-only and tiny,
+# so shipping it costs nothing measurable.
+!tests/test_packagedetector.py
