@@ -1,6 +1,7 @@
-# Build the container image on every push to main and publish it to GHCR as
+# Build the container image, test it, and only then publish it to GHCR as
 # ghcr.io/<owner>/<repo>:main. The fleet host pulls that tag on its own
-# schedule, so "push to main" IS the deploy. Mirrors birdlisten's workflow.
+# schedule, so "push to main" IS the deploy, and a failing smoke or unit
+# test keeps the old image in place. Pull requests build and test only.
 #
 # Also pushes :sha-<short> so a bad release can be pinned back in
 # fleet/compose.yaml by changing one tag.
@@ -53,30 +54,41 @@ jobs:
             type=sha,prefix=sha-
             type=ref,event=pr
 
-      - name: Build and push
+      # Build once into the runner's local Docker so the tests below run on
+      # the exact image, and only push it if they pass. The push step reuses
+      # this build's cache, so it does not rebuild.
+      - name: Build (for testing)
         uses: docker/build-push-action@v6
         with:
           context: .
           platforms: linux/amd64
-          push: ${{ github.event_name != 'pull_request' }}
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
+          load: true
+          push: false
+          tags: package-detector:test
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
       # Smoke test: the image must at least start and parse --help. Catches
       # a broken requirements file or a bad module name before the fleet pulls it.
+      # pipefail: without it the step takes `tail`'s exit code and never fails.
       - name: Smoke test
-        if: github.event_name != 'pull_request'
         run: |
-          tag=$(printf '%s\n' "${{ steps.meta.outputs.tags }}" | grep ':sha-' | head -1)
-          echo "testing $tag"
-          docker run --rm -e LOOP_ONCE=1 -e RUN_ARGS="--help" "$tag" 2>&1 | tail -20
+          set -o pipefail
+          docker run --rm -e LOOP_ONCE=1 -e RUN_ARGS="--help" package-detector:test 2>&1 | tail -20
 
       # Unit tests run in the image's own Python (stdlib only, no camera,
       # no model, no network) — same gate as the local `python -m unittest`.
       - name: Unit tests
+        run: docker run --rm --entrypoint python package-detector:test -m unittest discover -s tests -v
+
+      # Only reached when both tests passed. Pull requests stop here.
+      - name: Push
         if: github.event_name != 'pull_request'
-        run: |
-          tag=$(printf '%s\n' "${{ steps.meta.outputs.tags }}" | grep ':sha-' | head -1)
-          docker run --rm --entrypoint python "$tag" -m unittest discover -s tests -v
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
