@@ -114,9 +114,10 @@ looking at, not a crash.
    2026-10-29 read-only audit of the fleet repo confirmed this; same
    shape as `birdlisten`: image
    `ghcr.io/joekraemer/package-detector:main`, `env_file`, a volume
-   at `/data`, `restart: unless-stopped`), push fleet. Once the build
-   workflow in [Deploy](#deploy) is in place, pushes to this repo's
-   `main` build and publish the image to GHCR; the fleet host pulling
+   at `/data`, `restart: unless-stopped`), push fleet. The build
+   workflow in [Deploy](#deploy) is in place (added 2026-10-29,
+   issue #7 closed), so pushes to this repo's `main` build and
+   publish the image to GHCR; the fleet host pulling
    that tag is what deploys it. The fleet repo itself is private, so
    its self-hosted health runner is not exposed to public pull
    requests.
@@ -275,11 +276,11 @@ for pinning back a bad release, then smoke-tests the image
 (`--help` must work). "Push to main IS the deploy" — the fleet host
 pulls `:main` on its own schedule.
 
-That workflow file is **not in this repo yet** (issue #7 — it could
+That workflow file landed on `main` 2026-10-29 (issue #7 — it could
 not be pushed via the GitHub integration, which needs a separate
-workflow permission, so it must be added via the GitHub web UI or a
-local git push). Until it lands, no GHCR image is published and a
-fleet service block would have nothing to pull.
+workflow permission, so it was added via the GitHub web UI) and the
+first GHCR image has published, so a fleet service block now has
+something to pull.
 
 Divergences from birdlisten, on purpose:
 
