@@ -12,13 +12,20 @@ RUN apt-get update \
  && apt-get clean \
  && find /var/lib/apt/lists -mindepth 1 -delete
 
-ENV PYTHONUNBUFFERED=1 \
+# uv from its official image: reproducible, no curl|sh.
+# 0.11 matches the uv that writes uv.lock (revision 3).
+COPY --from=ghcr.io/astral-sh/uv:0.11 /uv /uvx /bin/
+ENV UV_COMPILE_BYTECODE=1 \
+    UV_LINK_MODE=copy \
+    UV_PROJECT_ENVIRONMENT=/app/.venv \
+    PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1
 WORKDIR /app
-
-# Pinned requirements first so this layer caches across code-only changes.
-COPY requirements.txt ./
-RUN pip install --no-cache-dir -r requirements.txt
+# Dependencies first so this layer caches across code-only changes. With
+# [tool.uv] package = false the project itself is never installed, so this
+# single sync is the whole environment; the code just needs to be present.
+COPY pyproject.toml uv.lock ./
+RUN uv sync --frozen --no-dev --no-install-project
 
 COPY . .
 RUN test -f packagedetector.py && test -f loop.py
@@ -28,6 +35,7 @@ RUN test -f packagedetector.py && test -f loop.py
 RUN useradd --create-home --uid 10001 app && mkdir /data /models && chown -R app:app /app /data /models
 USER app
 VOLUME /data
+ENV PATH="/app/.venv/bin:$PATH"
 
 # loop.py calls main() once per poll and sleeps LOOP_INTERVAL between polls.
 CMD ["python", "loop.py"]
