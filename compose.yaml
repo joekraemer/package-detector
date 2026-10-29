@@ -15,9 +15,7 @@ services:
     env_file: .env
     environment:
       PYTHONUNBUFFERED: "1"
-      # loop.py sleeps this long between polls; POLL_INTERVAL_SECONDS in
-      # .env is the app's own view of the same number. Keep them equal.
-      LOOP_INTERVAL: "15"
+      # The poll interval is POLL_INTERVAL_SECONDS in .env; loop.py reads it.
       LOOP_JITTER: "0"
     volumes:
       - package-detector-data:/data

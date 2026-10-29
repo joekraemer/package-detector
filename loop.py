@@ -4,10 +4,10 @@
 Copied in shape from birdlisten's loop.py, with one difference that
 matters: birdlisten's main() runs forever in stream mode, so its loop
 interval is 1 s (restart quickly after a fatal error). Here main() is
-ONE poll, so LOOP_INTERVAL *is* the poll interval — set it to the same
-number as POLL_INTERVAL_SECONDS in .env (default 15). Note the loop
-sleeps LOOP_INTERVAL *after* a poll finishes, so the real period is
-poll duration + interval, not a strict 15 s cadence.
+ONE poll, so the loop interval *is* the poll interval. It comes from
+POLL_INTERVAL_SECONDS in .env (default 15); LOOP_INTERVAL, if set,
+overrides it. Note the loop sleeps *after* a poll finishes, so the real
+period is poll duration + interval, not a strict 15 s cadence.
 
 Why a loop and not cron: the container is then an ordinary long-running
 service. Docker's `restart: unless-stopped` restarts it if it dies,
@@ -15,7 +15,7 @@ service. Docker's `restart: unless-stopped` restarts it if it dies,
 to maintain per app. One process, one job, one log stream.
 
 Environment:
-  LOOP_INTERVAL   seconds between polls (default 15)
+  LOOP_INTERVAL   seconds between polls (default: POLL_INTERVAL_SECONDS, else 15)
   LOOP_JITTER     random extra 0..N seconds per run (default 0)
   LOOP_ONCE       set to 1 to run a single poll and exit (handy for testing)
   RUN_ARGS        extra CLI args passed to the app, space separated
@@ -53,10 +53,17 @@ def _handle_signal(signum, frame):  # noqa: ARG001
     _stop = True
 
 
+def _interval(env) -> int:
+    """Seconds between polls: LOOP_INTERVAL if set (fleet convention),
+    else the app's own POLL_INTERVAL_SECONDS, else 15. One number to set."""
+    raw = env.get("LOOP_INTERVAL") or env.get("POLL_INTERVAL_SECONDS") or "15"
+    return max(int(raw), 1)
+
+
 def main() -> int:
     signal.signal(signal.SIGTERM, _handle_signal)
     signal.signal(signal.SIGINT, _handle_signal)
-    interval = int(os.environ.get("LOOP_INTERVAL", "15"))
+    interval = _interval(os.environ)
     jitter = int(os.environ.get("LOOP_JITTER", "0"))
     once = os.environ.get("LOOP_ONCE", "") == "1"
     run_args = shlex.split(os.environ.get("RUN_ARGS", ""))
