@@ -22,9 +22,9 @@
 
 ## Collecting frames
 
-`capture.py` runs on any always-on machine on the home network with
-ffmpeg and the same `.env` as the detector (see `.env.example`, the
-`CAPTURE_*` block). Two cameras: `doorbell` (trigger: the doorbell's
+`capture.py` runs on the fleet MacBook (below), configured by the same
+env variables as the detector (see `.env.example`, the `CAPTURE_*`
+block). Two cameras: `doorbell` (trigger: the doorbell's
 person sensor) and `garage` (trigger: its motion sensor).
 
 ```text
@@ -51,18 +51,30 @@ redrawing a zone means re-cropping, not re-shooting. Layout:
 `CAPTURE_DIR/YYYY-MM-DD/<camera>/<HHMMSS>_<reason>.jpg` plus one
 `index.jsonl` per day (`file, camera, ts, reason, phase, event?, tag?`).
 
-To keep it running on the Mac after the terminal or agent session
-closes (launchd restarts it if it exits; `caffeinate -s` stops the Mac
-sleeping while on power, which would otherwise pause capture):
+### Where it runs: the fleet MacBook
+
+Capture runs on the fleet host as its own container, `package-capture`:
+the same `ghcr.io/joekraemer/package-detector:main` image as the
+detector, with `python capture.py run` as the command. It is behind the
+compose profile `package-capture`, so it starts only once
+`~/.config/fleet/package-capture.env` exists on the fleet Mac (the
+`CAMERAS`, `HA_*` and `CAPTURE_*` lines from `.env.example`;
+`CAPTURE_DIR=/data/frames`), and it stops when that file is removed.
+Frames live in the named volume `package-capture-data`.
+
+On the fleet Mac:
 
 ```text
-launchctl submit -l com.joekraemer.package-capture \
-  -o ~/Library/Logs/package-capture.log -e ~/Library/Logs/package-capture.log -- \
-  /usr/bin/caffeinate -s /opt/homebrew/bin/uv run --project /Users/jkraem/workplace/package-detector \
-  python /Users/jkraem/workplace/package-detector/capture.py \
-  --env-file /Users/jkraem/workplace/package-detector/.env run
-launchctl remove com.joekraemer.package-capture   # stop it
+cd ~/fleet
+docker compose exec package-capture python capture.py check
+docker compose exec -it package-capture python capture.py session --tag empty
+docker compose logs --tail 50 package-capture
+# copy the frames out (for labelling/training elsewhere):
+docker run --rm -v fleet_package-capture-data:/d:ro alpine tar czf - -C /d frames > ~/package-frames.tgz
 ```
+
+(The volume's full name carries the compose project prefix; check it
+with `docker volume ls | grep package-capture`.)
 
 ## Target (original detector plan)
 

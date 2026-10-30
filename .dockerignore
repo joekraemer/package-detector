@@ -22,3 +22,5 @@ models/
 # importable: 'tests'" (issue #12). The test file is stdlib-only and tiny,
 # so shipping it costs nothing measurable.
 !tests/test_packagedetector.py
+!tests/test_capture.py
+package-data/
