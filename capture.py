@@ -181,6 +181,13 @@ def baseline_interval_s(cfg: CaptureConfig, phase: str) -> float:
     return minutes * 60.0
 
 
+def baseline_due(cfg: CaptureConfig, last: float | None, now: float, phase: str) -> bool:
+    """Judged against the CURRENT phase's interval, not the one in force
+    at the last shot: a night frame at 05:44 must not push the next frame
+    to 06:44 when twilight (10 min cadence) starts at 05:45."""
+    return last is None or now - last >= baseline_interval_s(cfg, phase)
+
+
 # ---------------------------------------------------------------- triggers
 
 @dataclass
@@ -252,25 +259,51 @@ class TriggerTracker:
 # ---------------------------------------------------------------- Home Assistant
 
 class HomeAssistant:
+    """Tiny REST client. Failures are logged at most once per entity per
+    WARN_EVERY_S, plus one line when the entity is reachable again: the
+    trigger poll runs every 2 s, and fleet's health check opens an issue
+    for any log line matching 'error', so a HA restart must not produce
+    a flood of lines, nor an exception class name like ConnectionError."""
+
+    WARN_EVERY_S = 1800.0
+
     def __init__(self, url: str, token: str):
         self.url, self.token = url, token
+        self._failing_since: dict[str, float] = {}
+        self._last_warn: dict[str, float] = {}
 
     @property
     def configured(self) -> bool:
         return bool(self.url and self.token)
 
+    def _fail(self, entity_id: str, why: str, now: float) -> None:
+        self._failing_since.setdefault(entity_id, now)
+        if now - self._last_warn.get(entity_id, -1e18) >= self.WARN_EVERY_S:
+            mins = (now - self._failing_since[entity_id]) / 60
+            log.warning("HA %s unavailable (%s) for %.0f min; retrying every %.0f s",
+                        entity_id, why, mins, TRIGGER_POLL_S)
+            self._last_warn[entity_id] = now
+
+    def _ok(self, entity_id: str, now: float) -> None:
+        since = self._failing_since.pop(entity_id, None)
+        if since is not None:
+            self._last_warn.pop(entity_id, None)
+            log.info("HA %s reachable again after %.0f min", entity_id, (now - since) / 60)
+
     def state(self, entity_id: str) -> dict | None:
         """GET /api/states/<id>. None on any failure (logged, token-free)."""
         import requests
+        now = time.time()
         try:
             r = requests.get(f"{self.url}/api/states/{entity_id}", timeout=5,
                              headers={"Authorization": f"Bearer {self.token}"})
-        except requests.RequestException as exc:
-            log.warning("HA %s: %s", entity_id, type(exc).__name__)
+        except requests.RequestException:
+            self._fail(entity_id, "unreachable", now)
             return None
         if r.status_code != 200:
-            log.warning("HA %s: HTTP %s", entity_id, r.status_code)
+            self._fail(entity_id, f"HTTP {r.status_code}", now)
             return None
+        self._ok(entity_id, now)
         return r.json()
 
 
@@ -359,7 +392,7 @@ def cmd_run(cfg: CaptureConfig) -> int:
     tracker = TriggerTracker(cfg.after_seconds, cfg.max_events_per_hour)
     by_name = {c.name: c for c in cfg.cameras}
     sun, sun_at = None, 0.0
-    next_baseline = 0.0
+    last_baseline: float | None = None
     log.info("capturing %s into %s", ", ".join(by_name), os.path.abspath(cfg.capture_dir))
     while True:
         now = time.time()
@@ -376,10 +409,10 @@ def cmd_run(cfg: CaptureConfig) -> int:
         for s in shots:
             take(cfg, by_name[s.camera], s.reason, phase, event=s.event)
 
-        if now >= next_baseline:
+        if baseline_due(cfg, last_baseline, now, phase):
             for cam in cfg.cameras:
                 take(cfg, cam, "baseline", phase)
-            next_baseline = now + baseline_interval_s(cfg, phase)
+            last_baseline = now
         time.sleep(TRIGGER_POLL_S)
 
 

@@ -145,6 +145,26 @@ class TestTracker(unittest.TestCase):
         self.assertEqual([s.camera for s in t.due(100)], ["doorbell"])
 
 
+class TestBaselineAndHA(unittest.TestCase):
+    def test_baseline_uses_current_phase(self):
+        cfg = load_capture_config({"CAMERAS": CAMS})
+        self.assertTrue(capture.baseline_due(cfg, None, 0, "night"))
+        # Last frame was a night frame 11 min ago; twilight (10 min) has begun.
+        self.assertFalse(capture.baseline_due(cfg, 0, 11 * 60, "night"))
+        self.assertTrue(capture.baseline_due(cfg, 0, 11 * 60, "twilight"))
+
+    def test_ha_failures_are_rate_limited_and_never_say_error(self):
+        ha = capture.HomeAssistant("http://ha", "t")
+        with self.assertLogs("capture", level="INFO") as logs:
+            for i in range(100):  # 200 s of 2 s polls
+                ha._fail("binary_sensor.x", "unreachable", 1000 + i * 2)
+            ha._ok("binary_sensor.x", 1300)
+            ha._fail("binary_sensor.x", "HTTP 401", 1302)  # new outage: warns again
+        self.assertEqual(len(logs.output), 3)
+        self.assertIn("reachable again", logs.output[1])
+        self.assertFalse(any("error" in line.lower() for line in logs.output))
+
+
 class TestTake(unittest.TestCase):
     def setUp(self):
         self.dir = tempfile.mkdtemp()
