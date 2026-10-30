@@ -5,3 +5,4 @@ __pycache__/
 .agents/
 models/
 *.onnx
+package-data/
