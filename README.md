@@ -234,6 +234,11 @@ issue #6 if you want it as an option.
 
 ## Model
 
+**Plan changed 2026-10-29:** v1 will be a yes/no zone classifier
+(YOLO11n-cls) rather than a box detector, trained on frames collected
+by `capture.py`. See [docs/MODEL.md](docs/MODEL.md). The text below
+describes the current detector code until the service switch lands.
+
 Design target: **YOLO11n, ONNX, CPU-only, single class `package`**.
 YOLO11n is 2.6M parameters; published CPU ONNX speed is ~56 ms per
 640 px image on a server-class CPU (your host will be slower, but at
@@ -328,4 +333,5 @@ Divergences from birdlisten, on purpose:
 | `pyproject.toml`, `uv.lock` | uv environment (fleet app contract, issue #5); `uv.lock` is committed and frozen in the image build |
 | `docs/MODEL.md` | model + dataset + evaluation plan |
 | `tests/` | stdlib unittest: config, zones, state machine, HA payload — no camera, no model, no network |
+| `capture.py` | training-data collector (not deployed): sun-aware baseline frames, HA-triggered visit frames, tagged staged sessions; see docs/MODEL.md |
 | `verification-capture.sh` | issue #2 capture tool: one snapshot per camera per round, host-only log, no credentials logged |
