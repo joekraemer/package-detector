@@ -87,7 +87,7 @@ Input 640 px. The deployed service never sees PyTorch or Ultralytics;
 it only runs the `.onnx` file with onnxruntime.
 
 Why YOLO11n: 2.6M parameters, ~56 ms CPU ONNX per image published for
-a server-class CPU. At one frame per camera every 3 minutes, inference
+a server-class CPU. At one frame per camera every 15 seconds, inference
 speed is not the constraint — accuracy on your porch is. If 11n proves
 too weak on small/distant boxes, the step up is 11s (9.4M params,
 ~90 ms), not a bigger jump; the service code does not care which size
