@@ -7,6 +7,7 @@ torchvision==0.29.2
 numpy==2.5.4
 pillow==13.0.0
 onnx==1.23.2
-onnxscript==0.5.6
+onnxscript==0.7.2
+onnx-ir==1.1.0
 onnxslim==0.1.99
 onnxruntime==1.22.0

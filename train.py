@@ -148,7 +148,9 @@ def paste(base: Image.Image, patch: Image.Image, rng: random.Random, floor_top: 
     if rng.random() < 0.5:
         patch = ImageOps.mirror(patch)
     x = rng.randint(0, base.width - pw)
-    y = rng.randint(int(base.height * floor_top), base.height - ph)
+    # A tall patch (a bag standing up) may not fit below floor_top: then it
+    # sits on the bottom edge and pokes up past the floor line.
+    y = rng.randint(min(int(base.height * floor_top), base.height - ph), base.height - ph)
     region = base.crop((x, y, x + pw, y + ph))
     if is_night(base):
         patch = ImageOps.grayscale(patch).convert("RGB")

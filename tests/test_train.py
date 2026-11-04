@@ -71,6 +71,13 @@ class Paste(unittest.TestCase):
         self.assertTrue(len(rows) > 0)
         self.assertGreaterEqual(rows.min(), int(100 * train.FLOOR_TOP))
 
+    def test_patch_taller_than_floor_still_pastes(self):
+        base = Image.new("RGB", (200, 100), (90, 90, 90))
+        patch = Image.new("RGB", (20, 60), (200, 150, 100))  # taller than the floor strip
+        for seed in range(20):
+            out = train.paste(base, patch, random.Random(seed))
+            self.assertEqual(out.size, base.size)
+
     def test_night_base_gets_a_grey_patch(self):
         base = Image.new("RGB", (200, 100), (60, 60, 60))
         patch = Image.new("RGB", (30, 15), (200, 120, 40))
