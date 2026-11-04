@@ -88,7 +88,7 @@ def load_env_file(path: str, env: dict) -> None:
 
 
 def parse_triggers(value: str, camera_names: list[str]) -> dict[str, str]:
-    """`doorbell=binary_sensor.doorbell_person,garage=binary_sensor.garage_motion`."""
+    """`doorbell=binary_sensor.doorbell_person,garage=binary_sensor.garage_person`."""
     triggers: dict[str, str] = {}
     for part in value.split(","):
         part = part.strip()
