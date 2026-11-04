@@ -4,6 +4,7 @@
 .venv
 .venv-train
 requirements-train.txt
+*.pt
 __pycache__
 *.pyc
 .env

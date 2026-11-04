@@ -1,5 +1,7 @@
 .venv/
 .venv-train/
+# Ultralytics downloads base weights (yolo11n-cls.pt) into the cwd.
+*.pt
 __pycache__/
 *.pyc
 .env
