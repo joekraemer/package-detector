@@ -18,6 +18,8 @@ docs/MODEL.md, "copy the frames out"). Two subcommands:
       Loopback-only labelling page, highest score first. Keys:
       j/k or arrows move, p = package, e = empty, s = unsure, u = undo,
       r = flip the current card to its "before the visit" reference.
+      /zones draws one rectangle per camera (saved to zones.json and
+      re-scored); with a zone, only that rectangle counts.
       Labels append to labels.jsonl (last line per file wins).
 
 The score is a ranking aid, not a label: a parked car, a person or a
@@ -29,6 +31,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import threading
 from collections import defaultdict
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -43,6 +46,10 @@ SMALL = (160, 120)  # score at quarter resolution: fast, ignores JPEG noise
 # Rows to ignore, as fractions of the image height: the timestamp overlay
 # at the top changes every frame, and the garage's top strip is the street.
 MASK_TOP = {"doorbell": 0.08, "garage": 0.30}
+# Drawn on the /zones page: {camera: [x0, y0, x1, y1]} as fractions of the
+# frame. When a camera has a zone, only that rectangle is scored. Committed
+# to the repo because the classifier crops the same zone later.
+ZONES_FILE = Path(__file__).resolve().parent / "zones.json"
 DIFF_THRESHOLD = 30  # 0-255 grey levels, after brightness matching
 REF_WINDOW_MIN = (60, 120, 240)  # widen until enough reference frames
 REF_MIN_FRAMES = 3
@@ -126,15 +133,39 @@ def previous_baseline(row: dict, baselines: list[dict]) -> dict | None:
     return best
 
 
-def change_score(img: np.ndarray, ref: np.ndarray, camera: str) -> float:
-    top = int(img.shape[0] * MASK_TOP.get(camera, 0.08))
-    a, b = img[top:], ref[top:]
+def load_zones(path: Path = ZONES_FILE) -> dict[str, list[float]]:
+    if not path.is_file():
+        return {}
+    raw = json.loads(path.read_text())
+    return {cam: z for cam, z in raw.items() if valid_zone(z)}
+
+
+def valid_zone(z) -> bool:
+    return (isinstance(z, list) and len(z) == 4
+            and all(isinstance(v, (int, float)) and 0 <= v <= 1 for v in z)
+            and z[2] - z[0] >= 0.02 and z[3] - z[1] >= 0.02)
+
+
+def crop(img: np.ndarray, zone: list[float]) -> np.ndarray:
+    h, w = img.shape[:2]
+    x0, y0, x1, y1 = zone
+    return img[int(y0 * h):max(int(y1 * h), int(y0 * h) + 1), int(x0 * w):max(int(x1 * w), int(x0 * w) + 1)]
+
+
+def change_score(img: np.ndarray, ref: np.ndarray, camera: str,
+                 zone: list[float] | None = None) -> float:
+    if zone:
+        a, b = crop(img, zone), crop(ref, zone)
+    else:
+        top = int(img.shape[0] * MASK_TOP.get(camera, 0.08))
+        a, b = img[top:], ref[top:]
     # Match overall brightness so a cloud or dusk doesn't count as change.
     a = a * (b.mean() / max(a.mean(), 1.0))
     return float((np.abs(a - b) > DIFF_THRESHOLD).mean())
 
 
-def cmd_score(data: Path) -> int:
+def cmd_score(data: Path, zones_path: Path = ZONES_FILE) -> int:
+    zones = load_zones(zones_path)
     rows = load_index(data)
     if not rows:
         print(f"no frames under {data}", file=sys.stderr)
@@ -152,17 +183,19 @@ def cmd_score(data: Path) -> int:
             by_cam[r["camera"]].append(r)
 
     out = data / "scores.jsonl"
+    tmp = out.with_suffix(".jsonl.tmp")  # the page may read while we write
     n = 0
-    with out.open("w") as fh:
+    with tmp.open("w") as fh:
         for cam_rows in _group(rows, "camera").values():
             cache: dict = {"img": img}
             bases = by_cam[cam_rows[0]["camera"]]
             for r in cam_rows:
                 ref = reference_for(r, bases, cache)
                 frame = img(r["file"])
-                s_days = None if ref is None else change_score(frame, ref, r["camera"])
+                zone = zones.get(r["camera"])
+                s_days = None if ref is None else change_score(frame, ref, r["camera"], zone)
                 prev = previous_baseline(r, bases)
-                s_prev = None if prev is None else change_score(frame, img(prev["file"]), r["camera"])
+                s_prev = None if prev is None else change_score(frame, img(prev["file"]), r["camera"], zone)
                 # A package left behind is new against both references; dusk
                 # light or the clock change only against the other days.
                 parts = [s for s in (s_days, s_prev) if s is not None]
@@ -175,7 +208,9 @@ def cmd_score(data: Path) -> int:
                 n += 1
             # Free this camera's pixels before the next one.
             imgs.clear()
-    print(f"scored {n} frames -> {out}")
+    tmp.replace(out)
+    zoned = ", ".join(sorted(zones)) or "none"
+    print(f"scored {n} frames -> {out} (zones: {zoned})")
     return 0
 
 
@@ -224,7 +259,7 @@ kbd{background:#333;border-radius:3px;padding:0 4px}
  <label>Reason <select id="reason"><option value="">all</option><option>baseline</option><option>arrive</option>
    <option>after_30s</option><option>after_120s</option></select></label>
  <label><input type="checkbox" id="unlab" checked> unlabelled only</label>
- <span id="count"></span>
+ <span id="count"></span> <a href="zones" style="color:#4ea1ff">draw zones</a>
  <span style="margin-left:auto"><kbd>j</kbd>/<kbd>k</kbd> move · <kbd>p</kbd> package · <kbd>e</kbd> empty ·
  <kbd>s</kbd> unsure · <kbd>u</kbd> undo · <kbd>r</kbd> show/hide reference · click = full size</span>
 </header>
@@ -277,8 +312,76 @@ load();
 </script></body></html>"""
 
 
-def make_handler(data: Path, port: int):
+ZONES_PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
+<title>Draw zones</title>
+<style>
+body{font:14px system-ui,sans-serif;margin:0;background:#111;color:#eee;padding:12px}
+.cam{display:inline-block;vertical-align:top;margin:0 16px 16px 0}
+.wrap{position:relative;width:640px;height:480px;cursor:crosshair;user-select:none;touch-action:none}
+.wrap img{width:640px;height:480px;display:block}
+.box{position:absolute;border:3px solid #ffd400;background:rgba(255,212,0,.15);pointer-events:none}
+button{font:inherit;padding:6px 14px;margin-right:8px}
+#status{margin-left:8px}
+code{color:#ffd400}
+</style></head><body>
+<h1 style="font-size:18px;margin:0 0 8px">Draw one rectangle per camera where packages land</h1>
+<p style="margin:0 0 12px;color:#bbb">Drag on a picture to draw. Keep it tight, but include the
+spots a courier might use (edge of the mat, beside the table). Then <b>Save &amp; re-score</b>.
+<a href="./" style="color:#4ea1ff">Back to review</a></p>
+<div id="cams"></div>
+<button id="save">Save &amp; re-score</button><span id="status" role="status"></span>
+<script>
+let zones={};
+async function init(){
+  const r=await (await fetch('api/zones')).json(); zones=r.zones;
+  const host=document.getElementById('cams');
+  for(const [cam,file] of Object.entries(r.samples)){
+    const div=document.createElement('div'); div.className='cam';
+    div.innerHTML=`<h2 style="font-size:15px;margin:0 0 4px">${cam} <code id="z-${cam}"></code>
+      <button data-clear="${cam}" style="font-size:12px;padding:2px 8px">clear</button></h2>
+      <div class="wrap" id="w-${cam}"><img src="img/${encodeURI(file)}" alt="${cam} sample frame" draggable="false"><div class="box" id="b-${cam}"></div></div>`;
+    host.appendChild(div); wire(cam); show(cam);
+  }
+  document.querySelectorAll('[data-clear]').forEach(b=>b.onclick=()=>{delete zones[b.dataset.clear];show(b.dataset.clear);});
+}
+function show(cam){
+  const b=document.getElementById('b-'+cam), z=zones[cam], t=document.getElementById('z-'+cam);
+  if(!z){b.style.display='none'; t.textContent='(no zone)'; return;}
+  Object.assign(b.style,{display:'block',left:z[0]*100+'%',top:z[1]*100+'%',width:(z[2]-z[0])*100+'%',height:(z[3]-z[1])*100+'%'});
+  t.textContent=z.map(v=>v.toFixed(2)).join(', ');
+}
+function wire(cam){
+  const w=document.getElementById('w-'+cam); let start=null;
+  const pos=e=>{const r=w.getBoundingClientRect();return [Math.min(Math.max((e.clientX-r.left)/r.width,0),1),Math.min(Math.max((e.clientY-r.top)/r.height,0),1)];};
+  w.onpointerdown=e=>{start=pos(e); w.setPointerCapture(e.pointerId);};
+  w.onpointermove=e=>{ if(!start) return; const p=pos(e);
+    zones[cam]=[Math.min(start[0],p[0]),Math.min(start[1],p[1]),Math.max(start[0],p[0]),Math.max(start[1],p[1])]; show(cam);};
+  w.onpointerup=()=>{start=null;};
+}
+document.getElementById('save').onclick=async()=>{
+  const s=document.getElementById('status'); s.textContent='saving and re-scoring (about 20 s)…';
+  const r=await fetch('api/zones',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(zones)});
+  s.textContent=r.ok?'saved. Re-scored with the new zones.':'save failed ('+r.status+')';
+};
+init();
+</script></body></html>"""
+
+
+def sample_frames(data: Path) -> dict[str, str]:
+    """Latest daytime baseline per camera, for drawing zones on."""
+    out: dict[str, str] = {}
+    scores = data / "scores.jsonl"
+    if scores.is_file():
+        for line in scores.read_text().splitlines():
+            r = json.loads(line)
+            if r["reason"] == "baseline" and r["phase"] == "day":
+                out[r["camera"]] = r["file"]  # file is time-ordered per camera
+    return out
+
+
+def make_handler(data: Path, port: int, zones_path: Path = ZONES_FILE):
     labels_path = data / "labels.jsonl"
+    score_lock = threading.Lock()
     allowed_hosts = {f"127.0.0.1:{port}", f"localhost:{port}"}
     root = data.resolve()
 
@@ -308,6 +411,11 @@ def make_handler(data: Path, port: int):
             path = urlparse(self.path).path
             if path == "/":
                 return self._send(200, PAGE.encode(), "text/html; charset=utf-8")
+            if path == "/zones":
+                return self._send(200, ZONES_PAGE.encode(), "text/html; charset=utf-8")
+            if path == "/api/zones":
+                body = {"zones": load_zones(zones_path), "samples": sample_frames(data)}
+                return self._send(200, json.dumps(body).encode(), "application/json")
             if path == "/api/frames":
                 labels = read_labels(labels_path)
                 rows = []
@@ -330,7 +438,12 @@ def make_handler(data: Path, port: int):
         def do_POST(self):
             if not self._host_ok():
                 return
-            if urlparse(self.path).path != "/api/label" or self.headers.get("Content-Type") != "application/json":
+            path = urlparse(self.path).path
+            if self.headers.get("Content-Type") != "application/json":
+                return self.send_error(400)
+            if path == "/api/zones":
+                return self._save_zones()
+            if path != "/api/label":
                 return self.send_error(400)
             try:
                 body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0)))[:10_000])
@@ -345,6 +458,20 @@ def make_handler(data: Path, port: int):
                 fh.write(json.dumps({"file": f, "label": label,
                                      "at": datetime.now().astimezone().isoformat(timespec="seconds")}) + "\n")
             self._send(200, b"{}", "application/json")
+
+        def _save_zones(self):
+            try:
+                body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0)))[:10_000])
+            except ValueError:
+                return self.send_error(400)
+            if not isinstance(body, dict) or not all(
+                    isinstance(c, str) and c.isidentifier() and valid_zone(z) for c, z in body.items()):
+                return self.send_error(400)
+            zones = {c: [round(float(v), 3) for v in z] for c, z in sorted(body.items())}
+            zones_path.write_text(json.dumps(zones, indent=2) + "\n")
+            with score_lock:  # one re-score at a time
+                cmd_score(data, zones_path)
+            self._send(200, json.dumps(zones).encode(), "application/json")
 
     return Handler
 

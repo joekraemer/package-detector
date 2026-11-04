@@ -72,6 +72,23 @@ class ChangeScore(unittest.TestCase):
         self.assertEqual(review.change_score(img, ref, "garage"), 0.0)
 
 
+class Zones(unittest.TestCase):
+    def test_change_outside_zone_is_ignored(self):
+        ref = np.full((120, 160), 100, np.float32)
+        img = ref.copy()
+        img[0:40, 0:40] = 220  # top-left: outside the floor zone
+        zone = [0.25, 0.6, 0.75, 1.0]
+        self.assertEqual(review.change_score(img, ref, "doorbell", zone), 0.0)
+        img[90:110, 60:100] = 220  # inside it
+        self.assertGreater(review.change_score(img, ref, "doorbell", zone), 0.1)
+
+    def test_valid_zone(self):
+        self.assertTrue(review.valid_zone([0.1, 0.2, 0.5, 0.9]))
+        self.assertFalse(review.valid_zone([0.5, 0.2, 0.1, 0.9]))  # inverted
+        self.assertFalse(review.valid_zone([0.1, 0.2, 0.11, 0.9]))  # too thin
+        self.assertFalse(review.valid_zone("0,0,1,1"))
+
+
 class ReferenceAcrossDays(unittest.TestCase):
     def test_same_day_baselines_never_used(self):
         cache = {"img": lambda f: np.zeros((2, 2), np.float32)}
@@ -113,15 +130,44 @@ class EndToEnd(unittest.TestCase):
             (self.data / day / "index.jsonl").write_text(
                 "".join(json.dumps(r) + "\n" for r in rows if r["file"].startswith(day)))
 
+    def test_zone_save_rescores_and_rejects_bad_input(self):
+        zones_path = self.data / "zones.json"
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), review.make_handler(self.data, 0, zones_path))
+        port = srv.server_address[1]
+        srv.RequestHandlerClass = review.make_handler(self.data, port, zones_path)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.addCleanup(srv.server_close)
+        self.addCleanup(srv.shutdown)
+        base = f"http://127.0.0.1:{port}"
+
+        def post(body):
+            return urllib.request.urlopen(urllib.request.Request(
+                base + "/api/zones", method="POST", data=json.dumps(body).encode(),
+                headers={"Content-Type": "application/json"}))
+
+        # Zone away from the "package": that frame should no longer stand out.
+        post({"doorbell": [0.0, 0.1, 0.25, 0.5]})
+        self.assertEqual(review.load_zones(zones_path), {"doorbell": [0.0, 0.1, 0.25, 0.5]})
+        scores = {json.loads(l)["file"]: json.loads(l)["score"]
+                  for l in (self.data / "scores.jsonl").read_text().splitlines()}
+        self.assertLess(scores["2026-11-04/doorbell/104000_baseline.jpg"], 0.01)
+        for bad in ({"doorbell": [0.5, 0.5, 0.4, 0.9]}, {"doorbell": [0, 0, 2, 1]}, {"../x": [0, 0, 1, 1]}, []):
+            with self.assertRaises(urllib.error.HTTPError) as e:
+                post(bad)
+            self.assertEqual(e.exception.code, 400)
+        page = urllib.request.urlopen(base + "/api/zones")
+        self.assertIn("doorbell", json.load(page)["samples"])
+
     def test_package_frame_ranks_first_and_labels_persist(self):
-        self.assertEqual(review.cmd_score(self.data), 0)
+        self.assertEqual(review.cmd_score(self.data, self.data / "no-zones.json"), 0)
         scores = [json.loads(l) for l in (self.data / "scores.jsonl").read_text().splitlines()]
         top = max(scores, key=lambda r: r["score"] or 0)
         self.assertEqual(top["file"], "2026-11-04/doorbell/104000_baseline.jpg")
 
-        srv = ThreadingHTTPServer(("127.0.0.1", 0), review.make_handler(self.data, 0))
+        nz = self.data / "no-zones.json"
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), review.make_handler(self.data, 0, nz))
         port = srv.server_address[1]
-        srv.RequestHandlerClass = review.make_handler(self.data, port)
+        srv.RequestHandlerClass = review.make_handler(self.data, port, nz)
         threading.Thread(target=srv.serve_forever, daemon=True).start()
         self.addCleanup(srv.server_close)
         self.addCleanup(srv.shutdown)
