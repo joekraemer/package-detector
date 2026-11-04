@@ -38,6 +38,10 @@ logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
 MODEL_INPUT = 640  # YOLO11n ONNX input size (square, letterboxed)
+# Zone classifier (train.py): crops are saved at CLS_CROP_PX square, then
+# the network resizes them to the model's imgsz. classify() repeats both
+# steps so the service sees exactly what training and evaluation saw.
+CLS_CROP_PX = 256
 # Camera names become part of a Home Assistant entity id
 # (binary_sensor.package_<name>), which allows only these characters.
 CAMERA_NAME_RE = re.compile(r"^[a-z0-9_]+$")
@@ -75,6 +79,9 @@ class Config:
     data_dir: str = "/data"
     snapshot_timeout_s: int = 15
     ha_refresh_seconds: int = 300
+    # Shadow mode: run the full loop (state machine, SQLite, evidence) but
+    # never call Home Assistant; state changes are only logged.
+    ha_dry_run: bool = False
 
 
 def parse_cameras(value: str) -> list[Camera]:
@@ -158,6 +165,15 @@ def _env_float(env: dict, key: str, default: float) -> float:
     return val
 
 
+def _env_bool(env: dict, key: str) -> bool:
+    raw = env.get(key, "").strip().lower()
+    if raw in ("", "0", "false", "no"):
+        return False
+    if raw in ("1", "true", "yes"):
+        return True
+    raise ConfigError(f"{key} must be 1/0/true/false, got {raw!r}")
+
+
 def load_config(env: dict | None = None, require_ha: bool = False) -> Config:
     env = dict(os.environ) if env is None else env
     cameras = parse_cameras(env.get("CAMERAS", ""))
@@ -178,8 +194,9 @@ def load_config(env: dict | None = None, require_ha: bool = False) -> Config:
         data_dir=env.get("DATA_DIR", "/data"),
         snapshot_timeout_s=_env_int(env, "SNAPSHOT_TIMEOUT_S", 15, 3, 120),
         ha_refresh_seconds=_env_int(env, "HA_REFRESH_SECONDS", 300, 60, 3600),
+        ha_dry_run=_env_bool(env, "HA_DRY_RUN"),
     )
-    if require_ha and (not cfg.ha_url or not cfg.ha_token):
+    if require_ha and not cfg.ha_dry_run and (not cfg.ha_url or not cfg.ha_token):
         raise ConfigError("live run needs HA_URL and HA_TOKEN (not needed for --check/--dry-run)")
     return cfg
 
@@ -358,6 +375,55 @@ def detect(image_path: str, model_path: str, confidence: float) -> list[dict]:
     return result
 
 
+def load_model_meta(model_path: str) -> dict | None:
+    """The sidecar `<model>.json` that train.py writes next to a zone
+    classifier. None means the model is the (older) box detector.
+
+    {"classes": ["empty", "package"], "imgsz": 224,
+     "cameras": {"doorbell": [x0, y0, x1, y1]}}   # zones it was trained on
+    """
+    path = os.path.splitext(model_path)[0] + ".json"
+    if not os.path.exists(path):
+        return None
+    with open(path) as fh:
+        meta = json.load(fh)
+    classes, cams = meta.get("classes"), meta.get("cameras")
+    if (not isinstance(classes, list) or "package" not in classes
+            or not isinstance(meta.get("imgsz"), int) or not isinstance(cams, dict)):
+        raise ConfigError(f"{path}: expected classes (with 'package'), imgsz and cameras")
+    return meta
+
+
+def classifier_input(im, zone: tuple[float, float, float, float], size: int):
+    """Zone crop -> CLS_CROP_PX square -> size square, RGB/255, NCHW float32.
+    Must stay in step with train.py (zone_crop + to_square + the network's
+    own resize); tests/test_packagedetector.py checks that it does."""
+    import numpy as np
+    from PIL import Image
+
+    im = im.convert("RGB")
+    w, h = im.size
+    crop = im.crop((int(zone[0] * w), int(zone[1] * h), int(zone[2] * w), int(zone[3] * h)))
+    sq = crop.resize((CLS_CROP_PX, CLS_CROP_PX), Image.BILINEAR)
+    x = np.asarray(sq.resize((size, size), Image.BILINEAR), dtype=np.float32) / 255.0
+    return x.transpose(2, 0, 1)[None, :, :, :]
+
+
+def classify(image_path: str, model_path: str, zone: tuple[float, float, float, float],
+             meta: dict) -> float:
+    """Probability that a package is in `zone` of this frame."""
+    from PIL import Image
+
+    with Image.open(image_path) as im:
+        x = classifier_input(im, zone, meta["imgsz"])
+    session = _session(model_path)
+    out = session.run(None, {session.get_inputs()[0].name: x})[0]
+    return float(out.reshape(-1)[meta["classes"].index("package")])
+
+
+_warned_no_zone: set[str] = set()
+
+
 def annotate(image_path: str, detections: list[dict], dest_path: str) -> None:
     """Draw boxes on a copy for the evidence file. Best effort only."""
     try:
@@ -471,6 +537,7 @@ def poll_once(cfg: Config, dry_run: bool = False) -> int:
     if not model_ok:
         log.warning("model not found at %s; running capture-only (no detections)",
                     cfg.model_path)
+    meta = load_model_meta(cfg.model_path) if model_ok else None
     for cam in cfg.cameras:
         snap, err = capture_snapshot(cam.url, cfg.snapshot_timeout_s)
         if snap is None:
@@ -478,7 +545,7 @@ def poll_once(cfg: Config, dry_run: bool = False) -> int:
             rc = 1
             continue
         try:
-            rc |= _poll_camera(cfg, conn, cam, snap, model_ok, now, dry_run)
+            rc |= _poll_camera(cfg, conn, cam, snap, model_ok, now, dry_run, meta)
         finally:
             # capture_snapshot used a temp file: remove it on every path.
             _remove(snap)
@@ -487,19 +554,41 @@ def poll_once(cfg: Config, dry_run: bool = False) -> int:
     return rc
 
 
+def classifier_zone(cfg: Config, meta: dict, camera: str):
+    """ZONES from the env wins; else the zone the model was trained on."""
+    zone = cfg.zones.get(camera) or meta["cameras"].get(camera)
+    return tuple(zone) if zone else None
+
+
 def _poll_camera(cfg: Config, conn: sqlite3.Connection | None, cam: Camera, snap: str,
-                 model_ok: bool, now: str, dry_run: bool) -> int:
-    try:
-        detections = detect(snap, cfg.model_path, cfg.confidence) if model_ok else []
-    except Exception:  # noqa: BLE001 — one bad inference must not kill the poll
-        log.error("camera %s: inference failed", cam.name, exc_info=True)
-        return 1
-    kept = [d for d in detections
-            if zone_contains(cfg.zones.get(cam.name), d["box"])]
-    detected = bool(kept)
-    best = max((d["confidence"] for d in kept), default=None)
-    log.info("camera %s: detected=%s best=%.2f kept=%d raw=%d",
-             cam.name, detected, best or 0.0, len(kept), len(detections))
+                 model_ok: bool, now: str, dry_run: bool, meta: dict | None = None) -> int:
+    if meta is not None:
+        zone = classifier_zone(cfg, meta, cam.name)
+        if zone is None:
+            if cam.name not in _warned_no_zone:
+                _warned_no_zone.add(cam.name)
+                log.warning("camera %s: the classifier has no zone for it; skipping", cam.name)
+            return 0
+        try:
+            p = classify(snap, cfg.model_path, zone, meta)
+        except Exception:  # noqa: BLE001 — one bad inference must not kill the poll
+            log.error("camera %s: inference failed", cam.name, exc_info=True)
+            return 1
+        detected, best = p >= cfg.confidence, round(p, 3)
+        kept = [{"box": zone, "confidence": p}] if detected else []
+        log.info("camera %s: p_package=%.3f detected=%s", cam.name, p, detected)
+    else:
+        try:
+            detections = detect(snap, cfg.model_path, cfg.confidence) if model_ok else []
+        except Exception:  # noqa: BLE001 — one bad inference must not kill the poll
+            log.error("camera %s: inference failed", cam.name, exc_info=True)
+            return 1
+        kept = [d for d in detections
+                if zone_contains(cfg.zones.get(cam.name), d["box"])]
+        detected = bool(kept)
+        best = max((d["confidence"] for d in kept), default=None)
+        log.info("camera %s: detected=%s best=%.2f kept=%d raw=%d",
+                 cam.name, detected, best or 0.0, len(kept), len(detections))
     if dry_run:
         if cfg.ha_url:
             log.info("dry-run HA payload for %s: %s",
@@ -525,7 +614,13 @@ def _poll_camera(cfg: Config, conn: sqlite3.Connection | None, cam: Camera, snap
         ev = os.path.join(ev_dir, f"{cam.name}_{int(time.time())}.jpg")
         annotate(snap, kept, ev)
     epoch = time.time()
-    if needs_ha_post(changed, s.ha_synced, s.ha_posted, epoch, cfg.ha_refresh_seconds):
+    if cfg.ha_dry_run:
+        # ha_synced/ha_posted stay untouched, so switching HA_DRY_RUN off
+        # posts the current state on the very next poll.
+        if changed:
+            log.info("camera %s: state %s -> %s (HA_DRY_RUN: Home Assistant not updated), "
+                     "evidence %s", cam.name, old_present, new_present, ev)
+    elif needs_ha_post(changed, s.ha_synced, s.ha_posted, epoch, cfg.ha_refresh_seconds):
         err = post_to_ha(cfg, cam.name, new_present, best, s.last_seen)
         s.ha_synced = not err
         if err:
@@ -553,6 +648,22 @@ def cmd_check(cfg: Config) -> int:
         problems.append("ffmpeg not found")
     if not os.path.exists(cfg.model_path):
         problems.append(f"model not found at {cfg.model_path} (capture-only until weights arrive)")
+    else:
+        try:
+            meta = load_model_meta(cfg.model_path)
+        except (ConfigError, ValueError) as exc:
+            meta = None
+            problems.append(str(exc))
+        if meta is None:
+            print(f"model: box detector {cfg.model_path}")
+        else:
+            print(f"model: zone classifier {cfg.model_path}, imgsz {meta['imgsz']}, "
+                  f"trained on {sorted(meta['cameras'])}")
+            for cam in cfg.cameras:
+                zone = classifier_zone(cfg, meta, cam.name)
+                print(f"  {cam.name}: " + (f"zone {list(zone)}" if zone else "no zone, skipped"))
+    if cfg.ha_dry_run:
+        print("HA_DRY_RUN=1: state changes are logged, Home Assistant is never called")
     for cam in cfg.cameras:
         snap, err = capture_snapshot(cam.url, cfg.snapshot_timeout_s)
         if snap is None:

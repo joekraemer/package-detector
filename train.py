@@ -227,7 +227,8 @@ def cmd_prepare(data: Path, out: Path, camera: str, seed: int) -> int:
         counts["train", "empty"] += 1
 
     manifest = {"camera": camera, "zone": zone, "seed": seed, "counts": {f"{s}/{c}": n for (s, c), n in counts.items()},
-                "val_positive_files": sorted(pos["val"]), "cutouts_from": sorted(f for f in boxes if sides.get(f) == "train")}
+                "val_positive_files": sorted(pos["val"]), "val_files": sorted(pos["val"] + neg["val"][:cap["val"]]),
+                "cutouts_from": sorted(f for f in boxes if sides.get(f) == "train")}
     (out / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
     print(json.dumps(manifest["counts"], indent=2))
     return 0
@@ -268,29 +269,48 @@ def cmd_export() -> int:
     import onnxruntime as ort
     from ultralytics import YOLO
 
+    import packagedetector
+
     best = REPO / "package-data" / "runs" / "cls" / "weights" / "best.pt"
-    model = YOLO(str(best))
-    onnx_path = Path(model.export(format="onnx", imgsz=IMGSZ, opset=17, dynamic=False))
+    manifest = json.loads((OUT / "manifest.json").read_text())
+    exporter = YOLO(str(best))
+    onnx_path = Path(exporter.export(format="onnx", imgsz=IMGSZ, opset=17, dynamic=False))
     MODELS.mkdir(exist_ok=True)
     dest = MODELS / "package-cls.onnx"
     shutil.copy(onnx_path, dest)
-    (MODELS / "package-cls.json").write_text(json.dumps(
-        {"classes": [model.names[i] for i in sorted(model.names)], "imgsz": IMGSZ,
-         "zone": review.load_zones(), "preprocess": "zone crop -> stretch to imgsz square -> RGB/255, NCHW"},
-        indent=2) + "\n")
+    meta = {"classes": [exporter.names[i] for i in sorted(exporter.names)], "imgsz": IMGSZ,
+            "cameras": {manifest["camera"]: manifest["zone"]},
+            "preprocess": "zone crop -> 256 square -> imgsz square (bilinear), RGB/255, NCHW"}
+    (MODELS / "package-cls.json").write_text(json.dumps(meta, indent=2) + "\n")
 
-    # The service will run the ONNX file, so check it agrees with PyTorch.
+    # 1. The ONNX file agrees with PyTorch on the same input. Compare against
+    #    a FRESH model: export() changes the one it ran on.
+    model = YOLO(str(best))
     sess = ort.InferenceSession(str(dest), providers=["CPUExecutionProvider"])
     inp = sess.get_inputs()[0].name
-    pkg = next(i for i, n in model.names.items() if n == "package")
+    pkg = meta["classes"].index("package")
     worst = 0.0
     files = sorted((OUT / "val").glob("*/*.jpg"))
     for f in files:
-        x = np.asarray(Image.open(f).convert("RGB").resize((IMGSZ, IMGSZ)), np.float32) / 255.0
+        x = np.asarray(Image.open(f).convert("RGB").resize((IMGSZ, IMGSZ), Image.BILINEAR), np.float32) / 255.0
         p_onnx = float(sess.run(None, {inp: x.transpose(2, 0, 1)[None]})[0][0][pkg])
-        p_pt = float(model.predict(str(f), imgsz=IMGSZ, verbose=False)[0].probs.data[pkg])
+        p_pt = float(model.predict(str(f), imgsz=IMGSZ, device="cpu", verbose=False)[0].probs.data[pkg])
         worst = max(worst, abs(p_onnx - p_pt))
-    print(f"onnx -> {dest}  (max |onnx - torch| on {len(files)} val crops: {worst:.4f})")
+    print(f"onnx -> {dest}  (max |onnx - torch| on {len(files)} val crops: {worst:.6f})")
+
+    # 2. The service's own path (full frame in, classify() out) on the raw
+    #    val frames: these are the numbers that matter once deployed.
+    labels = resolve_labels(review.load_index(DATA), review.read_labels(DATA / "labels.jsonl"))
+    val = [f for f in manifest["val_files"]]
+    zone = tuple(manifest["zone"])
+    wrong = []
+    for f in val:
+        p = packagedetector.classify(str(DATA / f), str(dest), zone, meta)
+        if (p >= 0.5) != (labels[f] == "package"):
+            wrong.append((f, labels[f], round(p, 3)))
+    print(f"service path on {len(val)} raw val frames: {len(wrong)} wrong")
+    for w in wrong:
+        print("  wrong:", w)
     return 0
 
 

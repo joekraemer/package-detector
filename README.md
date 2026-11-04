@@ -150,7 +150,8 @@ the exit code.
 |---|---|---|
 | `CAMERAS` | — (required) | `name=rtsp-url` pairs, comma separated, same format as birdlisten. Names: lowercase letters, digits, `_` (each becomes `binary_sensor.package_<name>`) |
 | `POLL_INTERVAL_SECONDS` | `15` | seconds between polls, 15..900. 15 is the default; raise it if the host or NVR struggles. `loop.py` sleeps this long (a `LOOP_INTERVAL` env var overrides it) |
-| `MODEL_PATH` | `/models/package.onnx` | YOLO11n ONNX model, single `package` class. Mounted, not committed (see Model) |
+| `MODEL_PATH` | `/models/package.onnx` | ONNX model, mounted, not committed. If a `<model>.json` sidecar from `train.py` sits next to it (e.g. `package-cls.onnx` + `package-cls.json`), it is the **zone classifier**: each camera listed in the sidecar is classified on its zone crop, and `CONFIDENCE` is the p(package) bar. Without a sidecar it is treated as the older YOLO box detector |
+| `HA_DRY_RUN` | `0` | `1` = shadow mode: full loop (state machine, SQLite, evidence on changes) but Home Assistant is never called; state changes are only logged. `HA_URL`/`HA_TOKEN` not required |
 | `CONFIDENCE` | `0.5` | detection confidence bar, 0..1. Start here, tune from evidence (see Tuning) |
 | `CONFIRM_HITS` | `2` | consecutive polls with a detection before a camera flips to present (~30 s at 15 s polls) |
 | `CLEAR_MISSES` | `5` | consecutive polls without one before a camera flips to absent (~75 s at 15 s polls — a single dark/occluded frame must not clear a real package) |
