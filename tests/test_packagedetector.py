@@ -2,6 +2,7 @@
 No camera, no model, no network. Run: python -m unittest discover -s tests
 """
 
+import json
 import os
 import shutil
 import sys
@@ -262,6 +263,117 @@ class TestPollOnce(unittest.TestCase):
         s = self.state()
         self.assertTrue(s.present)
         self.assertFalse(s.ha_synced)   # unknown, so the next poll re-posts
+
+
+class TestClassifier(unittest.TestCase):
+    """Zone-classifier path: sidecar meta, preprocessing, poll and HA_DRY_RUN."""
+
+    META = {"classes": ["empty", "package"], "imgsz": 224,
+            "cameras": {"porch": [0.1, 0.5, 0.9, 1.0]}}
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.dir)
+        self.model = os.path.join(self.dir, "package-cls.onnx")
+        open(self.model, "w").close()
+        with open(os.path.join(self.dir, "package-cls.json"), "w") as fh:
+            json.dump(self.META, fh)
+        self.p = [0.9]
+        self.posts = []
+
+        def capture(url, timeout):
+            fd, path = tempfile.mkstemp(suffix=".jpg", dir=self.dir)
+            os.close(fd)
+            return path, ""
+
+        for name, fn in (("capture_snapshot", capture),
+                         ("classify", lambda *a: self.p[0]),
+                         ("post_to_ha", lambda *a: self.posts.append(a[2]) or "")):
+            p = mock.patch.object(pd, name, side_effect=fn)
+            p.start()
+            self.addCleanup(p.stop)
+        p = mock.patch.object(pd, "annotate")
+        p.start()
+        self.addCleanup(p.stop)
+
+    def cfg(self, **extra):
+        env = {"CAMERAS": "porch=rtsp://a,garage=rtsp://b", "DATA_DIR": self.dir,
+               "MODEL_PATH": self.model, "CONFIRM_HITS": "1", "CLEAR_MISSES": "1",
+               "HA_URL": "http://ha", "HA_TOKEN": "t"}
+        env.update(extra)
+        return load_config(env, require_ha=True)
+
+    def test_meta_is_read_and_validated(self):
+        self.assertEqual(pd.load_model_meta(self.model)["imgsz"], 224)
+        self.assertIsNone(pd.load_model_meta(os.path.join(self.dir, "other.onnx")))
+        with open(os.path.join(self.dir, "package-cls.json"), "w") as fh:
+            json.dump({"classes": ["a", "b"], "imgsz": 224, "cameras": {}}, fh)
+        with self.assertRaises(ConfigError):
+            pd.load_model_meta(self.model)
+
+    def test_threshold_and_live_post(self):
+        cfg = self.cfg()
+        pd.poll_once(cfg)
+        self.assertEqual(self.posts, [True])
+        self.p[0] = 0.2
+        pd.poll_once(cfg)
+        self.assertEqual(self.posts, [True, False])
+
+    def test_camera_without_zone_is_skipped(self):
+        # garage has no zone in the meta: only porch is classified.
+        with mock.patch.object(pd, "classify", return_value=0.9) as c:
+            pd.poll_once(self.cfg())
+        self.assertEqual(c.call_count, 1)
+        self.assertEqual(c.call_args.args[2], (0.1, 0.5, 0.9, 1.0))
+
+    def test_env_zone_overrides_meta(self):
+        with mock.patch.object(pd, "classify", return_value=0.9) as c:
+            pd.poll_once(self.cfg(ZONES="porch=0,0,0.5,0.5"))
+        self.assertEqual(c.call_args.args[2], (0.0, 0.0, 0.5, 0.5))
+
+    def test_ha_dry_run_never_posts_and_needs_no_token(self):
+        cfg = load_config({"CAMERAS": "porch=rtsp://a", "DATA_DIR": self.dir,
+                           "MODEL_PATH": self.model, "CONFIRM_HITS": "1",
+                           "CLEAR_MISSES": "1", "HA_DRY_RUN": "1"}, require_ha=True)
+        with self.assertLogs("packagedetector", "INFO") as logs:
+            pd.poll_once(cfg)
+            self.p[0] = 0.1
+            pd.poll_once(cfg)
+        self.assertEqual(self.posts, [])
+        changes = [l for l in logs.output if "HA_DRY_RUN" in l]
+        self.assertEqual(len(changes), 2)                       # on, then off
+        self.assertFalse(any("error" in l.lower() for l in logs.output))  # fleet health
+        conn = pd.init_db(self.dir)
+        s = pd.load_state(conn, "porch")
+        n = conn.execute("SELECT COUNT(*) FROM polls").fetchone()[0]
+        conn.close()
+        self.assertEqual(n, 2)          # polls still recorded for review
+        self.assertFalse(s.ha_synced)   # going live posts on the first poll
+
+    def test_bad_dry_run_value(self):
+        with self.assertRaises(ConfigError):
+            self.cfg(HA_DRY_RUN="maybe")
+
+
+class TestClassifierInput(unittest.TestCase):
+    """classifier_input must match train.py's crop + square + net resize."""
+
+    def test_matches_training_pipeline(self):
+        try:
+            import numpy as np
+            from PIL import Image
+            import train
+        except ImportError as exc:  # stdlib-only environments
+            self.skipTest(f"needs numpy/Pillow: {exc}")
+        rng = np.random.default_rng(0)
+        im = Image.fromarray(rng.integers(0, 255, (480, 640, 3), dtype=np.uint8))
+        zone = (0.057, 0.581, 0.618, 0.995)
+        got = pd.classifier_input(im, zone, 224)
+        sq = train.to_square(train.zone_crop(im, list(zone)))
+        want = np.asarray(sq.resize((224, 224), Image.BILINEAR), np.float32).transpose(2, 0, 1)[None] / 255.0
+        self.assertEqual(got.shape, (1, 3, 224, 224))
+        self.assertEqual(got.dtype, np.float32)
+        self.assertTrue(np.array_equal(got, want))
 
 
 class TestLoopInterval(unittest.TestCase):
