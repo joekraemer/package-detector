@@ -90,6 +90,21 @@ uv run python review.py score   # ranks frames by "new in the scene"
 uv run python review.py serve   # http://127.0.0.1:8781/, p/e/s/u keys
 ```
 
+Training the zone classifier (laptop only, its own env, see `train.py`):
+
+```text
+uv venv --python 3.12 .venv-train
+VIRTUAL_ENV=.venv-train uv pip install -r requirements-train.txt
+.venv-train/bin/python train.py prepare   # zone crops, split, copy-paste
+.venv-train/bin/python train.py fit       # YOLO11n-cls, val report, ONNX
+.venv-train/bin/python train.py export    # ONNX only, from the last best.pt
+```
+
+Package boxes for copy-paste live in `package-data/boxes.json`
+(`{file: [x0, y0, x1, y1]}`, frame fractions). The service must
+preprocess exactly like training: crop the zone, stretch it to a
+224×224 square, RGB/255 (`models/package-cls.json`).
+
 The score compares each frame with the median empty scene at that time
 on other days and with the last baseline before the visit, and keeps the
 smaller. It is only a ranking aid: cars, people, IR switching and sun

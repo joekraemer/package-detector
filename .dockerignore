@@ -2,6 +2,8 @@
 .git
 .github
 .venv
+.venv-train
+requirements-train.txt
 __pycache__
 *.pyc
 .env
@@ -24,4 +26,5 @@ models/
 !tests/test_packagedetector.py
 !tests/test_capture.py
 !tests/test_review.py
+!tests/test_train.py
 package-data/
