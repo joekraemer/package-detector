@@ -135,6 +135,9 @@ def cutout(frame: Path, box: list[float], margin: float = 0.15) -> Image.Image:
 
 
 FLOOR_TOP = 0.45  # doorbell zone: the floor starts ~45% down the crop
+# Where pasted packages may land, per camera (fraction of the zone crop's
+# height). The garage zone is driveway nearly to its top edge.
+FLOOR_TOP_BY_CAMERA = {"doorbell": 0.45, "garage": 0.15}
 
 
 def paste(base: Image.Image, patch: Image.Image, rng: random.Random, floor_top: float = FLOOR_TOP) -> Image.Image:
@@ -164,17 +167,23 @@ def paste(base: Image.Image, patch: Image.Image, rng: random.Random, floor_top: 
 
 # ------------------------------------------------------------ prepare
 
-def cmd_prepare(data: Path, out: Path, camera: str, seed: int) -> int:
+def cmd_prepare(data: Path, out: Path, cameras: list[str] | None, seed: int) -> int:
+    """One dataset for every camera with a zone (or just `cameras`).
+
+    Each camera gets its own labels, day split and zone crops. Package
+    cutouts (boxes.json, train side only) are pasted onto EVERY camera's
+    empty frames, so a camera with no staged packages yet (the garage)
+    still gets positives, and its everyday clutter (bins, leaves, car)
+    is learned as "empty"."""
     rng = random.Random(seed)
     zones = review.load_zones()
-    if camera not in zones:
-        print(f"no zone for {camera}: draw one on the review page (/zones) first", file=sys.stderr)
+    cameras = cameras or sorted(zones)
+    missing = [c for c in cameras if c not in zones]
+    if missing:
+        print(f"no zone for {missing}: draw one on the review page (/zones) first", file=sys.stderr)
         return 1
-    zone = zones[camera]
-    rows = [r for r in review.load_index(data) if r["camera"] == camera]
+    all_rows = review.load_index(data)
     human = review.read_labels(data / "labels.jsonl")
-    labels = resolve_labels(rows, human)
-    sides = split(rows, labels)
 
     if out.exists():
         shutil.rmtree(out)
@@ -182,55 +191,72 @@ def cmd_prepare(data: Path, out: Path, camera: str, seed: int) -> int:
         for cls in ("package", "empty"):
             (out / side / cls).mkdir(parents=True)
 
-    def crop_of(f: str) -> Image.Image:
-        return zone_crop(Image.open(data / f).convert("RGB"), zone)
-
     def save(im: Image.Image, side: str, cls: str, name: str):
         to_square(im).save(out / side / cls / f"{name}.jpg", quality=92)
 
-    pos = {s: [f for f, l in labels.items() if l == "package" and sides[f] == s] for s in ("train", "val")}
-    neg = {s: [f for f, l in labels.items() if l == "empty" and sides[f] == s] for s in ("train", "val")}
-    for s in ("train", "val"):
-        rng.shuffle(neg[s])
-
-    # Cutouts only from TRAIN positives, so nothing in val leaks into train.
+    # Per-camera labels and splits first: cutouts must come from train only.
+    per_cam = {}
+    sides_all: dict[str, str] = {}
+    for cam in cameras:
+        rows = [r for r in all_rows if r["camera"] == cam]
+        labels = resolve_labels(rows, human)
+        sides = split(rows, labels)
+        per_cam[cam] = (labels, sides)
+        sides_all.update(sides)
     boxes = json.loads(BOXES.read_text()) if BOXES.is_file() else {}
-    cutouts = [cutout(data / f, b) for f, b in boxes.items() if sides.get(f) == "train"]
-    n_paste = PASTES if cutouts else 0
+    cutout_files = sorted(f for f in boxes if sides_all.get(f) == "train")
+    cutouts = [cutout(data / f, boxes[f]) for f in cutout_files]
 
     counts = Counter()
-    for s in ("train", "val"):
-        for f in pos[s]:
-            save(crop_of(f), s, "package", f.replace("/", "_")[:-4])
-            counts[s, "package"] += 1
-    # Negatives: cap the ratio so the model can't win by always saying empty.
-    # Val keeps every negative of its day: the false-positive rate on real
-    # empty frames is the number that matters most.
-    cap = {"train": NEG_PER_POS * (len(pos["train"]) + n_paste), "val": len(neg["val"])}
-    for s in ("train", "val"):
-        for f in neg[s][:cap[s]]:
-            save(crop_of(f), s, "empty", f.replace("/", "_")[:-4])
-            counts[s, "empty"] += 1
+    manifest = {"seed": seed, "cameras": {}, "cutouts_from": cutout_files}
+    for cam in cameras:
+        labels, sides = per_cam[cam]
+        zone = zones[cam]
+        floor_top = FLOOR_TOP_BY_CAMERA.get(cam, FLOOR_TOP)
 
-    # Copy-paste positives onto train negatives, plus matched floor-patch negatives.
-    bases = neg["train"] or []
-    for i in range(n_paste):
-        base = crop_of(rng.choice(bases))
-        save(paste(base, rng.choice(cutouts), rng), "train", "package", f"paste_{i:04d}")
-        base2 = crop_of(rng.choice(bases))
-        w, h = base2.size
-        pw, ph = rng.randint(w // 12, w // 5), rng.randint(h // 10, h // 4)
-        px, py = rng.randint(0, w - pw), rng.randint(int(h * FLOOR_TOP), h - ph)
-        floor = base2.crop((px, py, px + pw, py + ph))
-        save(paste(base2, floor, rng), "train", "empty", f"floorpaste_{i:04d}")
-        counts["train", "package"] += 1
-        counts["train", "empty"] += 1
+        def crop_of(f: str) -> Image.Image:
+            return zone_crop(Image.open(data / f).convert("RGB"), zone)
 
-    manifest = {"camera": camera, "zone": zone, "seed": seed, "counts": {f"{s}/{c}": n for (s, c), n in counts.items()},
-                "val_positive_files": sorted(pos["val"]), "val_files": sorted(pos["val"] + neg["val"][:cap["val"]]),
-                "cutouts_from": sorted(f for f in boxes if sides.get(f) == "train")}
+        pos = {s: [f for f, l in labels.items() if l == "package" and sides[f] == s] for s in ("train", "val")}
+        neg = {s: [f for f, l in labels.items() if l == "empty" and sides[f] == s] for s in ("train", "val")}
+        for s in ("train", "val"):
+            rng.shuffle(neg[s])
+        n_paste = PASTES if cutouts and neg["train"] else 0
+
+        for s in ("train", "val"):
+            for f in pos[s]:
+                save(crop_of(f), s, "package", f.replace("/", "_")[:-4])
+                counts[cam, s, "package"] += 1
+        # Negatives: cap the ratio so the model can't win by always saying empty.
+        # Val keeps every negative of its day: the false-positive rate on real
+        # empty frames is the number that matters most.
+        cap = {"train": NEG_PER_POS * (len(pos["train"]) + n_paste), "val": len(neg["val"])}
+        for s in ("train", "val"):
+            for f in neg[s][:cap[s]]:
+                save(crop_of(f), s, "empty", f.replace("/", "_")[:-4])
+                counts[cam, s, "empty"] += 1
+
+        # Copy-paste positives onto train negatives, plus matched floor-patch negatives.
+        bases = neg["train"]
+        for i in range(n_paste):
+            base = crop_of(rng.choice(bases))
+            save(paste(base, rng.choice(cutouts), rng, floor_top), "train", "package", f"{cam}_paste_{i:04d}")
+            base2 = crop_of(rng.choice(bases))
+            w, h = base2.size
+            pw, ph = rng.randint(w // 12, w // 5), rng.randint(h // 10, h // 4)
+            px, py = rng.randint(0, w - pw), rng.randint(min(int(h * floor_top), h - ph), h - ph)
+            floor = base2.crop((px, py, px + pw, py + ph))
+            save(paste(base2, floor, rng, floor_top), "train", "empty", f"{cam}_floorpaste_{i:04d}")
+            counts[cam, "train", "package"] += 1
+            counts[cam, "train", "empty"] += 1
+
+        manifest["cameras"][cam] = {
+            "zone": zone,
+            "counts": {f"{s}/{c}": counts[cam, s, c] for s in ("train", "val") for c in ("package", "empty")},
+            "val_files": sorted(pos["val"] + neg["val"][:cap["val"]]),
+        }
     (out / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
-    print(json.dumps(manifest["counts"], indent=2))
+    print(json.dumps({c: m["counts"] for c, m in manifest["cameras"].items()}, indent=2))
     return 0
 
 
@@ -279,7 +305,7 @@ def cmd_export() -> int:
     dest = MODELS / "package-cls.onnx"
     shutil.copy(onnx_path, dest)
     meta = {"classes": [exporter.names[i] for i in sorted(exporter.names)], "imgsz": IMGSZ,
-            "cameras": {manifest["camera"]: manifest["zone"]},
+            "cameras": {c: m["zone"] for c, m in manifest["cameras"].items()},
             "preprocess": "zone crop -> 256 square -> imgsz square (bilinear), RGB/255, NCHW"}
     (MODELS / "package-cls.json").write_text(json.dumps(meta, indent=2) + "\n")
 
@@ -300,17 +326,24 @@ def cmd_export() -> int:
 
     # 2. The service's own path (full frame in, classify() out) on the raw
     #    val frames: these are the numbers that matter once deployed.
-    labels = resolve_labels(review.load_index(DATA), review.read_labels(DATA / "labels.jsonl"))
-    val = [f for f in manifest["val_files"]]
-    zone = tuple(manifest["zone"])
-    wrong = []
-    for f in val:
-        p = packagedetector.classify(str(DATA / f), str(dest), zone, meta)
-        if (p >= 0.5) != (labels[f] == "package"):
-            wrong.append((f, labels[f], round(p, 3)))
-    print(f"service path on {len(val)} raw val frames: {len(wrong)} wrong")
-    for w in wrong:
-        print("  wrong:", w)
+    rows = review.load_index(DATA)
+    human = review.read_labels(DATA / "labels.jsonl")
+    for cam, m in manifest["cameras"].items():
+        labels = resolve_labels([r for r in rows if r["camera"] == cam], human)
+        zone = tuple(m["zone"])
+        c = Counter()
+        wrong = []
+        for f in m["val_files"]:
+            p = packagedetector.classify(str(DATA / f), str(dest), zone, meta)
+            truth = labels[f]
+            said = p >= 0.5
+            c[truth, said] += 1
+            if said != (truth == "package"):
+                wrong.append((f, truth, round(p, 3)))
+        print(f"service path, {cam}: packages found {c['package', True]}/{c['package', True] + c['package', False]}, "
+              f"false positives {c['empty', True]}/{c['empty', True] + c['empty', False]}")
+        for w in wrong[:15]:
+            print("  wrong:", w)
     return 0
 
 
@@ -346,7 +379,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--seed", type=int, default=0)
     sub = ap.add_subparsers(dest="cmd", required=True)
     p = sub.add_parser("prepare")
-    p.add_argument("--camera", default="doorbell")
+    p.add_argument("--camera", action="append",
+                   help="limit to this camera (repeatable); default: every camera with a zone")
     f = sub.add_parser("fit")
     f.add_argument("--epochs", type=int, default=20)
     sub.add_parser("export")
