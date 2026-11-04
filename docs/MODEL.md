@@ -81,6 +81,21 @@ docker compose logs --tail 50 package-capture
 docker run --rm -v fleet_package-capture-data:/d:ro alpine tar czf - -C /d frames > ~/package-frames.tgz
 ```
 
+To look through the frames on the laptop, unpack them into `package-data/`
+(git-ignored) and use `review.py`:
+
+```text
+mkdir -p package-data && tar xzf ~/package-frames.tgz -C package-data
+uv run python review.py score   # ranks frames by "new in the scene"
+uv run python review.py serve   # http://127.0.0.1:8781/, p/e/s/u keys
+```
+
+The score compares each frame with the median empty scene at that time
+on other days and with the last baseline before the visit, and keeps the
+smaller. It is only a ranking aid: cars, people, IR switching and sun
+glare also rank high until zones are drawn. Labels go to
+`package-data/frames/labels.jsonl`.
+
 (The volume's full name carries the compose project prefix; check it
 with `docker volume ls | grep package-capture`.)
 

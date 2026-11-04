@@ -23,4 +23,5 @@ models/
 # so shipping it costs nothing measurable.
 !tests/test_packagedetector.py
 !tests/test_capture.py
+!tests/test_review.py
 package-data/
