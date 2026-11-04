@@ -62,6 +62,10 @@ compose profile `package-capture`, so it starts only once
 `CAPTURE_DIR=/data/frames`). To stop capturing, delete the service block
 from `fleet/compose.yaml`: deleting the env file also stops it, but then
 fleet's health check reports the app as not deployed on every run.
+After editing the env file, run `docker compose up -d package-capture`
+to recreate the container. `docker compose restart` keeps the old
+container and its old environment, so the edit would be silently ignored
+(`capture.py check` prints the triggers it is actually using).
 Sub-stream JPEGs are ~100 KB, so expect tens of MB per day for both
 cameras.
 Frames live in the named volume `package-capture-data`.
