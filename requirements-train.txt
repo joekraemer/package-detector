@@ -1,0 +1,13 @@
+# Laptop-only training environment for train.py (never in the service image).
+#   uv venv --python 3.12 .venv-train
+#   VIRTUAL_ENV=.venv-train uv pip install -r requirements-train.txt
+ultralytics==8.3.170
+torch==2.15.0
+torchvision==0.29.2
+numpy==2.5.4
+pillow==13.0.0
+onnx==1.23.2
+onnxscript==0.7.2
+onnx-ir==1.1.0
+onnxslim==0.1.99
+onnxruntime==1.22.0
