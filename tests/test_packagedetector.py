@@ -355,6 +355,147 @@ class TestClassifier(unittest.TestCase):
             self.cfg(HA_DRY_RUN="maybe")
 
 
+class TestNotify(unittest.TestCase):
+    """HA_NOTIFY: one push per arrival, retried on failure, cooldown, hello."""
+
+    META = {"classes": ["empty", "package"], "imgsz": 224,
+            "cameras": {"doorbell": [0.1, 0.5, 0.9, 1.0]}}
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.dir)
+        self.model = os.path.join(self.dir, "package-cls.onnx")
+        open(self.model, "w").close()
+        with open(os.path.join(self.dir, "package-cls.json"), "w") as fh:
+            json.dump(self.META, fh)
+        self.p = [0.9]
+        self.pushes = []
+        self.push_err = [""]
+        self.clock = [1_000_000.0]
+
+        def capture(url, timeout):
+            fd, path = tempfile.mkstemp(suffix=".jpg", dir=self.dir)
+            os.close(fd)
+            return path, ""
+
+        def notify(cfg, payload):
+            self.pushes.append(payload["title"])
+            return self.push_err[0]
+
+        for name, fn in (("capture_snapshot", capture),
+                         ("classify", lambda *a: self.p[0]),
+                         ("post_to_ha", lambda *a: ""),
+                         ("notify_ha", notify)):
+            p = mock.patch.object(pd, name, side_effect=fn)
+            p.start()
+            self.addCleanup(p.stop)
+        for name in ("annotate",):
+            p = mock.patch.object(pd, name)
+            p.start()
+            self.addCleanup(p.stop)
+        p = mock.patch.object(pd.time, "time", side_effect=lambda: self.clock[0])
+        p.start()
+        self.addCleanup(p.stop)
+
+    def cfg(self, **extra):
+        env = {"CAMERAS": "doorbell=rtsp://a", "DATA_DIR": self.dir, "MODEL_PATH": self.model,
+               "CONFIRM_HITS": "2", "CLEAR_MISSES": "2", "HA_URL": "http://ha", "HA_TOKEN": "t",
+               "HA_NOTIFY": "notify.mobile_app_phone"}
+        env.update(extra)
+        return load_config(env, require_ha=True)
+
+    def poll(self, cfg, p, n=1, dt=20):
+        self.p[0] = p
+        for _ in range(n):
+            pd.poll_once(cfg)
+            self.clock[0] += dt
+
+    def arrivals(self):
+        return [t for t in self.pushes if t.startswith("Package at")]
+
+    def test_parse(self):
+        self.assertEqual(pd.parse_notify("mobile_app_a, notify.b"),
+                         ["notify.mobile_app_a", "notify.b"])
+        self.assertEqual(pd.parse_notify(""), [])
+        for bad in ("notify.a/../b", "light.turn_on.x", "notify.A"):
+            with self.assertRaises(ConfigError):
+                pd.parse_notify(bad)
+
+    def test_one_push_per_arrival_after_confirmation(self):
+        cfg = self.cfg()
+        self.poll(cfg, 0.1, 2)
+        self.assertEqual(self.pushes, ["Package alerts are on"])   # hello, once
+        self.poll(cfg, 0.9)                 # 1st hit: not confirmed yet
+        self.assertEqual(self.arrivals(), [])
+        self.poll(cfg, 0.9, 5)              # confirmed, then it stays there
+        self.assertEqual(self.arrivals(), ["Package at the doorbell"])
+        self.assertEqual(self.pushes.count("Package alerts are on"), 1)
+
+    def test_failed_push_is_retried_while_present_and_dropped_once_gone(self):
+        cfg = self.cfg()
+        self.push_err[0] = "notify.mobile_app_phone: 500"
+        self.poll(cfg, 0.9, 2)              # hello fails twice; confirmed, arrival push fails
+        self.push_err[0] = ""
+        self.poll(cfg, 0.9)                 # both retried and sent
+        self.assertEqual(self.arrivals(), ["Package at the doorbell"] * 2)  # 1 failed + 1 sent
+        self.poll(cfg, 0.9, 3)
+        self.assertEqual(len(self.arrivals()), 2)                    # no more
+        conn = pd.init_db(self.dir)
+        hello = conn.execute("SELECT value FROM meta WHERE key='notify_hello'").fetchone()
+        conn.close()
+        self.assertEqual(hello[0], "notify.mobile_app_phone")
+
+    def test_pending_cleared_when_package_leaves_before_push_works(self):
+        cfg = self.cfg()
+        self.poll(cfg, 0.1)                 # hello sent
+        self.push_err[0] = "down"
+        self.poll(cfg, 0.9, 2)              # arrives, push fails
+        self.poll(cfg, 0.1, 2)              # gone
+        self.push_err[0] = ""
+        before = len(self.arrivals())
+        self.poll(cfg, 0.1, 3)
+        self.assertEqual(len(self.arrivals()), before)               # nothing stale sent
+
+    def test_cooldown(self):
+        cfg = self.cfg(HA_NOTIFY_COOLDOWN_SECONDS="1800")
+        self.poll(cfg, 0.9, 2)              # arrival 1
+        self.poll(cfg, 0.1, 2)              # gone
+        self.poll(cfg, 0.9, 2)              # arrival 2, minutes later: quiet
+        self.assertEqual(len(self.arrivals()), 1)
+        self.poll(cfg, 0.1, 2)
+        self.clock[0] += 1800
+        self.poll(cfg, 0.9, 2)              # arrival 3, after the cooldown
+        self.assertEqual(len(self.arrivals()), 2)
+
+    def test_dry_run_and_unset_never_push(self):
+        with self.assertLogs("packagedetector", "INFO") as logs:
+            self.poll(self.cfg(HA_DRY_RUN="1"), 0.9, 3)
+        self.assertEqual(self.pushes, [])
+        self.assertTrue(any("would notify" in l for l in logs.output))
+        self.poll(self.cfg(HA_NOTIFY="", DATA_DIR=tempfile.mkdtemp(dir=self.dir)), 0.9, 3)
+        self.assertEqual(self.pushes, [])
+
+    def test_going_live_with_a_package_already_there_does_not_push(self):
+        self.poll(self.cfg(HA_DRY_RUN="1"), 0.9, 3)     # present in shadow mode
+        self.poll(self.cfg(), 0.9, 3)                    # flip to live
+        self.assertEqual(self.arrivals(), [])
+        self.assertEqual(self.pushes, ["Package alerts are on"])
+
+    def test_restart_keeps_state(self):
+        self.poll(self.cfg(), 0.9, 2)
+        self.poll(self.cfg(), 0.9, 2)        # "new process": same db
+        self.assertEqual(len(self.arrivals()), 1)
+        self.assertEqual(self.pushes.count("Package alerts are on"), 1)
+
+    def test_payload(self):
+        from datetime import datetime as dt
+        p = pd.notify_payload("doorbell", 0.973, dt(2026, 11, 5, 15, 4))
+        self.assertEqual(p["title"], "Package at the doorbell")
+        self.assertIn("3:04 PM", p["message"])
+        self.assertIn("0.97", p["message"])
+        self.assertEqual(p["data"]["tag"], "package-doorbell")
+
+
 class TestClassifierInput(unittest.TestCase):
     """classifier_input must match train.py's crop + square + net resize."""
 
