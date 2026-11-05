@@ -57,9 +57,27 @@ PASTES = 300
 
 # ------------------------------------------------------------ labelling
 
-def resolve_labels(rows: list[dict], human: dict[str, str]) -> dict[str, str]:
+def read_staged_days(path: Path) -> set[tuple[str, str]]:
+    """(camera, day) pairs a labels.jsonl row marked `"staged": true`.
+
+    Staging without `capture.py session` (packages placed while the normal
+    triggers fire) leaves no session frame, so mark the hand labels of
+    that window staged: the day is then treated like a session day."""
+    out = set()
+    if path.is_file():
+        for line in path.read_text().splitlines():
+            if line.strip():
+                r = json.loads(line)
+                if r.get("staged"):
+                    parts = r["file"].split("/")
+                    out.add((parts[1], parts[0]))
+    return out
+
+
+def resolve_labels(rows: list[dict], human: dict[str, str],
+                   staged: set[tuple[str, str]] = frozenset()) -> dict[str, str]:
     """file -> 'package' | 'empty' for every frame we are willing to train on."""
-    session_days = {(r["camera"], r["file"][:10]) for r in rows if r["reason"] == "session"}
+    session_days = {(r["camera"], r["file"][:10]) for r in rows if r["reason"] == "session"} | set(staged)
     out: dict[str, str] = {}
     for r in rows:
         f = r["file"]
@@ -74,19 +92,28 @@ def resolve_labels(rows: list[dict], human: dict[str, str]) -> dict[str, str]:
     return out
 
 
-def split(rows: list[dict], labels: dict[str, str]) -> dict[str, str]:
-    """file -> 'train' | 'val' (time-ordered blocks, never shuffled)."""
+def split(rows: list[dict], labels: dict[str, str], staged: set[tuple[str, str]] = frozenset(),
+          group=None) -> dict[str, str]:
+    """file -> 'train' | 'val' (time-ordered blocks, never shuffled).
+
+    group(file) -> key, optional: positives are split per key (e.g. day vs
+    night), so a new night session does not all land in val."""
     by_file = {r["file"]: r for r in rows}
-    session_days = {r["file"][:10] for r in rows if r["reason"] == "session"}
+    session_days = ({r["file"][:10] for r in rows if r["reason"] == "session"}
+                    | {d for _, d in staged})
     neg_days = sorted({f[:10] for f, l in labels.items() if l == "empty"} - session_days)
     val_day = neg_days[-1] if len(neg_days) > 1 else None
     pos = sorted((f for f, l in labels.items() if l == "package"), key=lambda f: by_file[f]["ts"])
     # Real deliveries on the validation day stay with that day; of the rest,
-    # the newest VAL_POS_SHARE go to val.
+    # the newest VAL_POS_SHARE of each group go to val.
     val_pos = {f for f in pos if f[:10] == val_day}
-    rest = [f for f in pos if f not in val_pos]
-    n_val = max(1, round(len(rest) * VAL_POS_SHARE)) if len(rest) > 1 else 0
-    val_pos |= set(rest[len(rest) - n_val:])
+    groups: dict = defaultdict(list)
+    for f in pos:
+        if f not in val_pos:
+            groups[group(f) if group else None].append(f)
+    for rest in groups.values():
+        n_val = max(1, round(len(rest) * VAL_POS_SHARE)) if len(rest) > 1 else 0
+        val_pos |= set(rest[len(rest) - n_val:])
     out = {}
     for f, l in labels.items():
         if l == "package":
@@ -184,6 +211,11 @@ def cmd_prepare(data: Path, out: Path, cameras: list[str] | None, seed: int) -> 
         return 1
     all_rows = review.load_index(data)
     human = review.read_labels(data / "labels.jsonl")
+    staged = read_staged_days(data / "labels.jsonl")
+
+    def night_of(f: str) -> bool:
+        with Image.open(data / f) as im:
+            return is_night(im)
 
     if out.exists():
         shutil.rmtree(out)
@@ -199,8 +231,9 @@ def cmd_prepare(data: Path, out: Path, cameras: list[str] | None, seed: int) -> 
     sides_all: dict[str, str] = {}
     for cam in cameras:
         rows = [r for r in all_rows if r["camera"] == cam]
-        labels = resolve_labels(rows, human)
-        sides = split(rows, labels)
+        cam_staged = {s for s in staged if s[0] == cam}
+        labels = resolve_labels(rows, human, cam_staged)
+        sides = split(rows, labels, cam_staged, group=night_of)
         per_cam[cam] = (labels, sides)
         sides_all.update(sides)
     boxes = json.loads(BOXES.read_text()) if BOXES.is_file() else {}
@@ -328,8 +361,10 @@ def cmd_export() -> int:
     #    val frames: these are the numbers that matter once deployed.
     rows = review.load_index(DATA)
     human = review.read_labels(DATA / "labels.jsonl")
+    staged = read_staged_days(DATA / "labels.jsonl")
     for cam, m in manifest["cameras"].items():
-        labels = resolve_labels([r for r in rows if r["camera"] == cam], human)
+        labels = resolve_labels([r for r in rows if r["camera"] == cam], human,
+                                {s for s in staged if s[0] == cam})
         zone = tuple(m["zone"])
         c = Counter()
         wrong = []
