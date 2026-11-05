@@ -82,6 +82,12 @@ class Config:
     # Shadow mode: run the full loop (state machine, SQLite, evidence) but
     # never call Home Assistant; state changes are only logged.
     ha_dry_run: bool = False
+    # Home Assistant notify services to call when a package ARRIVES, e.g.
+    # ["notify.mobile_app_joes_iphone"]. Empty = sensor only, no pushes.
+    ha_notify: list[str] = field(default_factory=list)
+    # A camera that notified less than this long ago stays quiet on its next
+    # arrival, so a package flickering in and out cannot spam the phone.
+    ha_notify_cooldown_seconds: int = 1800
 
 
 def parse_cameras(value: str) -> list[Camera]:
@@ -174,6 +180,25 @@ def _env_bool(env: dict, key: str) -> bool:
     raise ConfigError(f"{key} must be 1/0/true/false, got {raw!r}")
 
 
+NOTIFY_RE = re.compile(r"^notify\.[a-z0-9_]+$")
+
+
+def parse_notify(value: str) -> list[str]:
+    """`notify.mobile_app_a,notify.mobile_app_b`; a bare `mobile_app_a` gets
+    the `notify.` prefix. Becomes part of an HA API path, so it is strict."""
+    out = []
+    for part in value.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "." not in part:
+            part = f"notify.{part}"
+        if not NOTIFY_RE.match(part):
+            raise ConfigError(f"HA_NOTIFY entry must look like notify.mobile_app_xxx, got {part!r}")
+        out.append(part)
+    return out
+
+
 def load_config(env: dict | None = None, require_ha: bool = False) -> Config:
     env = dict(os.environ) if env is None else env
     cameras = parse_cameras(env.get("CAMERAS", ""))
@@ -195,6 +220,8 @@ def load_config(env: dict | None = None, require_ha: bool = False) -> Config:
         snapshot_timeout_s=_env_int(env, "SNAPSHOT_TIMEOUT_S", 15, 3, 120),
         ha_refresh_seconds=_env_int(env, "HA_REFRESH_SECONDS", 300, 60, 3600),
         ha_dry_run=_env_bool(env, "HA_DRY_RUN"),
+        ha_notify=parse_notify(env.get("HA_NOTIFY", "")),
+        ha_notify_cooldown_seconds=_env_int(env, "HA_NOTIFY_COOLDOWN_SECONDS", 1800, 0, 86400),
     )
     if require_ha and not cfg.ha_dry_run and (not cfg.ha_url or not cfg.ha_token):
         raise ConfigError("live run needs HA_URL and HA_TOKEN (not needed for --check/--dry-run)")
@@ -460,6 +487,13 @@ def init_db(data_dir: str) -> sqlite3.Connection:
         conn.execute("ALTER TABLE camera_state ADD COLUMN ha_synced INTEGER DEFAULT 0")
     if "ha_posted" not in cols:
         conn.execute("ALTER TABLE camera_state ADD COLUMN ha_posted REAL")
+    # notify_pending: an arrival whose notification has not gone out yet.
+    # notified: epoch of the last notification sent for this camera.
+    if "notify_pending" not in cols:
+        conn.execute("ALTER TABLE camera_state ADD COLUMN notify_pending INTEGER DEFAULT 0")
+    if "notified" not in cols:
+        conn.execute("ALTER TABLE camera_state ADD COLUMN notified REAL")
+    conn.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)")
     conn.commit()
     return conn
 
@@ -473,22 +507,27 @@ class CamState:
     since: str | None = None       # when `present` last changed
     ha_synced: bool = False
     ha_posted: float | None = None
+    notify_pending: bool = False
+    notified: float | None = None
 
 
 def load_state(conn: sqlite3.Connection, camera: str) -> CamState:
-    row = conn.execute("""SELECT present, hits, misses, last_seen, since, ha_synced, ha_posted
+    row = conn.execute("""SELECT present, hits, misses, last_seen, since, ha_synced, ha_posted,
+                                 notify_pending, notified
                           FROM camera_state WHERE camera=?""", (camera,)).fetchone()
     if not row:
         return CamState()
-    return CamState(bool(row[0]), row[1], row[2], row[3], row[4], bool(row[5]), row[6])
+    return CamState(bool(row[0]), row[1], row[2], row[3], row[4], bool(row[5]), row[6],
+                    bool(row[7]), row[8])
 
 
 def save_state(conn: sqlite3.Connection, camera: str, s: CamState) -> None:
     conn.execute("""INSERT OR REPLACE INTO camera_state
-                    (camera, present, hits, misses, last_seen, since, ha_synced, ha_posted)
-                    VALUES (?,?,?,?,?,?,?,?)""",
+                    (camera, present, hits, misses, last_seen, since, ha_synced, ha_posted,
+                     notify_pending, notified)
+                    VALUES (?,?,?,?,?,?,?,?,?,?)""",
                  (camera, int(s.present), s.hits, s.misses, s.last_seen, s.since,
-                  int(s.ha_synced), s.ha_posted))
+                  int(s.ha_synced), s.ha_posted, int(s.notify_pending), s.notified))
 
 
 def needs_ha_post(changed: bool, synced: bool, last_post: float | None, now: float,
@@ -525,6 +564,82 @@ def post_to_ha(cfg: Config, camera: str, present: bool,
     return ""
 
 
+def notify_payload(camera: str, confidence: float | None, when: datetime | None = None) -> dict:
+    when = when or datetime.now()
+    at = when.strftime("%I:%M %p").lstrip("0")
+    place = camera.replace("_", " ")
+    conf = f" (confidence {confidence:.2f})" if confidence is not None else ""
+    # `tag` makes a newer alert for the same camera replace the older one.
+    return {"title": f"Package at the {place}",
+            "message": f"A package showed up at the {place} at {at}{conf}.",
+            "data": {"tag": f"package-{camera}"}}
+
+
+def notify_ha(cfg: Config, payload: dict) -> str:
+    """Call every HA_NOTIFY service. Returns "" if all succeeded, else an
+    error string naming the ones that failed (never the token)."""
+    import requests  # lazy: see module docstring
+    failed = []
+    for target in cfg.ha_notify:
+        domain, service = target.split(".", 1)
+        try:
+            resp = requests.post(f"{cfg.ha_url}/api/services/{domain}/{service}", json=payload,
+                                 headers={"Authorization": f"Bearer {cfg.ha_token}"},
+                                 timeout=10)
+            resp.raise_for_status()
+        except Exception as exc:  # noqa: BLE001 — a push failure must not kill the poll
+            failed.append(f"{target}: {exc}")
+    return "; ".join(failed)
+
+
+def _notify_hello(cfg: Config, conn: sqlite3.Connection) -> int:
+    """One "alerts are on" push per HA_NOTIFY setting, so whoever turned
+    alerts on gets proof on the phone that the path works. Stored in the
+    db: restarts and image updates stay quiet; changing HA_NOTIFY says hello
+    again. A failure is logged and retried on the next poll."""
+    want = ",".join(cfg.ha_notify)
+    row = conn.execute("SELECT value FROM meta WHERE key='notify_hello'").fetchone()
+    if row and row[0] == want:
+        return 0
+    cams = ", ".join(c.name.replace("_", " ") for c in cfg.cameras)
+    err = notify_ha(cfg, {"title": "Package alerts are on",
+                          "message": f"You'll get a notification when a package shows up ({cams}).",
+                          "data": {"tag": "package-detector-hello"}})
+    if err:
+        log.error("HA notify (alerts-on message) failed: %s (will retry next poll)", err)
+        return 1
+    conn.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('notify_hello', ?)", (want,))
+    conn.commit()
+    log.info("HA notify: alerts-on message sent to %s", want)
+    return 0
+
+
+def _handle_notify(cfg: Config, cam: Camera, s: CamState, changed: bool, present: bool,
+                   confidence: float | None, epoch: float) -> int:
+    """Arrival -> one notification. Leaving clears a notification that has
+    not gone out yet; a failed one is retried while the package is there."""
+    if changed and present:
+        s.notify_pending = True
+    if not present:
+        s.notify_pending = False
+    if not (s.notify_pending and cfg.ha_notify):
+        return 0
+    if (s.notified is not None and cfg.ha_notify_cooldown_seconds
+            and epoch - s.notified < cfg.ha_notify_cooldown_seconds):
+        log.info("camera %s: arrival within %ss of the last notification; not notifying again",
+                 cam.name, cfg.ha_notify_cooldown_seconds)
+        s.notify_pending = False
+        return 0
+    err = notify_ha(cfg, notify_payload(cam.name, confidence))
+    if err:
+        log.error("camera %s: HA notify failed: %s (will retry next poll)", cam.name, err)
+        return 1
+    s.notify_pending = False
+    s.notified = epoch
+    log.info("camera %s: notification sent to %s", cam.name, ",".join(cfg.ha_notify))
+    return 0
+
+
 # ---------------------------------------------------------------- poll
 
 def poll_once(cfg: Config, dry_run: bool = False) -> int:
@@ -538,6 +653,8 @@ def poll_once(cfg: Config, dry_run: bool = False) -> int:
         log.warning("model not found at %s; running capture-only (no detections)",
                     cfg.model_path)
     meta = load_model_meta(cfg.model_path) if model_ok else None
+    if conn is not None and cfg.ha_notify and not cfg.ha_dry_run:
+        rc |= _notify_hello(cfg, conn)
     for cam in cfg.cameras:
         snap, err = capture_snapshot(cam.url, cfg.snapshot_timeout_s)
         if snap is None:
@@ -620,17 +737,22 @@ def _poll_camera(cfg: Config, conn: sqlite3.Connection | None, cam: Camera, snap
         if changed:
             log.info("camera %s: state %s -> %s (HA_DRY_RUN: Home Assistant not updated), "
                      "evidence %s", cam.name, old_present, new_present, ev)
-    elif needs_ha_post(changed, s.ha_synced, s.ha_posted, epoch, cfg.ha_refresh_seconds):
-        err = post_to_ha(cfg, cam.name, new_present, best, s.last_seen)
-        s.ha_synced = not err
-        if err:
-            log.error("camera %s: %s (will retry next poll)", cam.name, err)
-            rc = 1
-        else:
-            s.ha_posted = epoch
-            if changed:
-                log.info("camera %s: state %s -> %s, HA updated, evidence %s",
-                         cam.name, old_present, new_present, ev)
+            if new_present and cfg.ha_notify:
+                log.info("camera %s: HA_DRY_RUN: would notify %s",
+                         cam.name, ",".join(cfg.ha_notify))
+    else:
+        if needs_ha_post(changed, s.ha_synced, s.ha_posted, epoch, cfg.ha_refresh_seconds):
+            err = post_to_ha(cfg, cam.name, new_present, best, s.last_seen)
+            s.ha_synced = not err
+            if err:
+                log.error("camera %s: %s (will retry next poll)", cam.name, err)
+                rc = 1
+            else:
+                s.ha_posted = epoch
+                if changed:
+                    log.info("camera %s: state %s -> %s, HA updated, evidence %s",
+                             cam.name, old_present, new_present, ev)
+        rc |= _handle_notify(cfg, cam, s, changed, new_present, best, epoch)
     save_state(conn, cam.name, s)
     conn.commit()
     return rc
@@ -664,6 +786,12 @@ def cmd_check(cfg: Config) -> int:
                 print(f"  {cam.name}: " + (f"zone {list(zone)}" if zone else "no zone, skipped"))
     if cfg.ha_dry_run:
         print("HA_DRY_RUN=1: state changes are logged, Home Assistant is never called")
+    if cfg.ha_notify:
+        print(f"notify on arrival: {', '.join(cfg.ha_notify)} "
+              f"(cooldown {cfg.ha_notify_cooldown_seconds}s)"
+              + (" -- not sent while HA_DRY_RUN=1" if cfg.ha_dry_run else ""))
+    else:
+        print("notify: off (HA_NOTIFY unset; sensor only)")
     for cam in cfg.cameras:
         snap, err = capture_snapshot(cam.url, cfg.snapshot_timeout_s)
         if snap is None:

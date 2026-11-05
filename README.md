@@ -22,22 +22,22 @@ camera 2 RTSP sub-stream ─┼─▶ ffmpeg snapshot (1 frame, every 15 s) ─�
    ...                    ┘                                                              └─▶ SQLite + evidence snapshot
 ```
 
-## Status: scaffold, not yet a working detector
+## Status (2026-11-05): live on the doorbell
 
-What is in here and verified: config parsing and validation, the
-per-camera present/absent state machine, zone filtering, the Home
-Assistant state payload, snapshot capture via ffmpeg, and the test suite
-for all of that — all without a camera or a model, by design.
-
-What is **not** in here yet, and is the real work:
-
-- **No model weights are shipped.** A stock YOLO model has no "package"
-  class — it knows person, car, dog, chair, but not box-on-porch. This
-  needs a YOLO11n model fine-tuned on packages, which does not exist in
-  this repo yet. See [Model](#model) and issue #1.
-- **Not verified against a real camera.** Snapshot capture, the NVR
-  session behaviour, and the zone geometry for your porch/garage views
-  are all untested. See issue #2.
+- **Doorbell:** a zone classifier trained on this porch (`train.py`,
+  YOLO11n-cls, day and night/IR data) runs on the fleet MacBook every
+  ~20 s and drives `binary_sensor.package_doorbell` plus a push on
+  arrival (`HA_NOTIFY`). Validation: 26/27 packages found, 1 false
+  positive in 69 empty frames (that frame is now excluded). Live test:
+  on 20 s after a package was put down, off 80 s after it was taken in.
+- **Garage:** zone drawn and frames labelled, but no model yet; the
+  doorbell model calls the garage bins packages. Not in the fleet env.
+  See issue #17.
+- **Weak spots:** a person standing over the package can hide it from
+  the model, and the night/IR set is one session. Issue #3.
+- Weights are not in git or the image: `models/package-cls.onnx` and its
+  `package-cls.json` sidecar are mounted at `/models` (see
+  [Model](#model)).
 - **No Home Assistant token or camera password is in this repo**, ever.
   They live only in `.env` / the fleet env file (see Setup).
 
@@ -159,6 +159,8 @@ the exit code.
 | `HA_URL` | — (required for live runs) | Home Assistant base URL, e.g. `http://homeassistant.local:8123` |
 | `HA_TOKEN` | — (required for live runs) | HA long-lived access token. Secret: fleet env file only, never committed |
 | `HA_REFRESH_SECONDS` | `300` | re-send each sensor's current state this often (60..3600), plus after any failed POST |
+| `HA_NOTIFY` | (unset = no pushes) | Home Assistant notify services to call when a package **arrives**, comma separated, e.g. `notify.mobile_app_joes_iphone`. One push per arrival; a failed push is retried while the package is still there. Not sent while `HA_DRY_RUN=1` (logged as "would notify" instead). The first live poll with a new `HA_NOTIFY` value sends one "Package alerts are on" push, so you know the path works |
+| `HA_NOTIFY_COOLDOWN_SECONDS` | `1800` | after a push, the same camera's next arrival within this many seconds stays quiet (0..86400, 0 = no cooldown), so a package flickering in and out can't spam the phone |
 | `DATA_DIR` | `/data` | SQLite db + evidence snapshots |
 | `SNAPSHOT_TIMEOUT_S` | `15` | ffmpeg snapshot timeout per camera |
 | `TZ` | `America/Los_Angeles` | timestamps |
@@ -227,11 +229,29 @@ Suggested automation (in HA, not in this repo — HA owns automations):
 ```
 
 Add one automation per camera, or a template sensor that ORs them.
-If you want a push the moment a package is confirmed, not just on
-arrival, that is a second automation on the sensor turning on — do not
-make this service send pushes itself. One job, one output: the sensor.
-ntfy (birdlisten's push path) is deliberately not wired in here; see
-issue #6 if you want it as an option.
+
+**Push on arrival, built in.** Set `HA_NOTIFY` (e.g.
+`notify.mobile_app_joes_iphone`) and the service itself calls that HA
+notify service when a camera flips to present:
+
+```text
+POST {HA_URL}/api/services/notify/<name>
+{"title": "Package at the doorbell",
+ "message": "A package showed up at the doorbell at 3:04 PM (confidence 0.97).",
+ "data": {"tag": "package-doorbell"}}
+```
+
+- One push per arrival, only after `CONFIRM_HITS` polls. A failed push is
+  retried while the package is still there and dropped once it's gone.
+- `HA_NOTIFY_COOLDOWN_SECONDS` (30 min) keeps a flickering package quiet.
+- The first live poll with a new `HA_NOTIFY` value sends one "Package
+  alerts are on" push, as proof the path works.
+- Restarts don't re-notify: the state is in SQLite.
+
+This was added (2026-11-05) so alerts could be turned on with a git
+change alone. An HA automation on the sensor is still the better home
+for anything conditional (quiet hours, only when away, a camera
+snapshot attached); leave `HA_NOTIFY` unset then, or you get two pushes.
 
 ## Model
 
