@@ -487,6 +487,15 @@ class TestNotify(unittest.TestCase):
         self.assertEqual(len(self.arrivals()), 1)
         self.assertEqual(self.pushes.count("Package alerts are on"), 1)
 
+    def test_notify_test_value_resends_alerts_on_once(self):
+        self.poll(self.cfg(), 0.1)
+        self.poll(self.cfg(HA_NOTIFY_TEST="2026-11-05"), 0.1, 3)   # changed: once
+        self.poll(self.cfg(HA_NOTIFY_TEST="2026-11-05"), 0.1, 2)   # same value: quiet
+        self.poll(self.cfg(HA_NOTIFY_TEST="2026-11-05b"), 0.1)     # changed again
+        self.assertEqual(self.pushes, ["Package alerts are on"] * 3)
+        with self.assertRaises(ConfigError):
+            self.cfg(HA_NOTIFY_TEST="bad value!")
+
     def test_payload(self):
         from datetime import datetime as dt
         p = pd.notify_payload("doorbell", 0.973, dt(2026, 11, 5, 15, 4))
