@@ -2,10 +2,14 @@
 Run: python -m unittest discover -s tests
 """
 
+import json
 import os
 import random
+import shutil
 import sys
+import tempfile
 import unittest
+from pathlib import Path
 
 import numpy as np
 from PIL import Image
@@ -16,7 +20,8 @@ import train  # noqa: E402
 
 
 def r(file, reason="baseline", tag=None, camera="doorbell"):
-    row = {"file": file, "camera": camera, "reason": reason, "ts": f"{file[:10]}T{file[20:22]}:{file[22:24]}:00-08:00"}
+    t = file.rsplit("/", 1)[1][:6]  # HHMMSS from the file name, any camera
+    row = {"file": file, "camera": camera, "reason": reason, "ts": f"{file[:10]}T{t[:2]}:{t[2:4]}:{t[4:6]}-08:00"}
     if tag:
         row["tag"] = tag
     return row
@@ -58,6 +63,57 @@ class Split(unittest.TestCase):
         # Of the staged positives, the newest share is val, the oldest train.
         self.assertEqual(sides["2026-11-04/doorbell/122520_session.jpg"], "train")
         self.assertEqual(sides["2026-11-04/doorbell/132907_session.jpg"], "val")
+
+
+class Staged(unittest.TestCase):
+    """Staging without session frames: hand labels marked staged."""
+
+    GROWS = [
+        r("2026-11-02/garage/100000_baseline.jpg", camera="garage"),
+        r("2026-11-03/garage/100000_baseline.jpg", camera="garage"),
+        r("2026-11-03/garage/110000_baseline.jpg", camera="garage"),
+        r("2026-11-04/garage/100000_baseline.jpg", camera="garage"),   # staging day, unlabelled
+        r("2026-11-04/garage/165838_after_30s.jpg", "after_30s", camera="garage"),
+        r("2026-11-04/garage/170138_after_30s.jpg", "after_30s", camera="garage"),
+        r("2026-11-04/garage/170206_baseline.jpg", camera="garage"),
+    ]
+    HUMAN = {"2026-11-04/garage/165838_after_30s.jpg": "package",
+             "2026-11-04/garage/170138_after_30s.jpg": "package",
+             "2026-11-04/garage/170206_baseline.jpg": "package"}
+
+    def test_read_staged_days(self):
+        d = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, d)
+        p = d / "labels.jsonl"
+        p.write_text(json.dumps({"file": "2026-11-04/garage/165838_after_30s.jpg", "label": "package",
+                                 "staged": True}) + "\n"
+                     + json.dumps({"file": "2026-11-03/doorbell/180533_arrive.jpg", "label": "package"}) + "\n")
+        self.assertEqual(train.read_staged_days(p), {("garage", "2026-11-04")})
+
+    def test_staged_day_is_not_auto_empty_and_not_the_val_day(self):
+        staged = {("garage", "2026-11-04")}
+        before = train.resolve_labels(self.GROWS, self.HUMAN)
+        self.assertEqual(before["2026-11-04/garage/100000_baseline.jpg"], "empty")  # the old bug
+        labels = train.resolve_labels(self.GROWS, self.HUMAN, staged)
+        self.assertNotIn("2026-11-04/garage/100000_baseline.jpg", labels)
+        sides = train.split(self.GROWS, labels, staged)
+        # Val day is the newest quiet day (11-03), so the staged positives
+        # are split by time instead of all landing in val with their day.
+        self.assertEqual(sides["2026-11-03/garage/110000_baseline.jpg"], "val")
+        self.assertEqual(sides["2026-11-04/garage/165838_after_30s.jpg"], "train")
+        self.assertEqual(sides["2026-11-04/garage/170206_baseline.jpg"], "val")
+
+    def test_group_split_puts_some_night_positives_in_train(self):
+        rows = [r(f"2026-11-04/doorbell/{t}_session.jpg", "session", "box") for t in
+                ("120000", "121000", "122000", "123000", "170000", "171000", "172000", "173000")]
+        labels = train.resolve_labels(rows, {})
+        night = lambda f: f[20:22] >= "17"  # noqa: E731
+        plain = train.split(rows, labels)
+        grouped = train.split(rows, labels, group=night)
+        # Plain: the newest 30% overall is val, and all of it is night.
+        self.assertEqual(sum(plain[f] == "val" for f in labels if not night(f)), 0)
+        self.assertEqual(sum(grouped[f] == "train" for f in labels if night(f)), 3)
+        self.assertEqual(sum(grouped[f] == "train" for f in labels if not night(f)), 3)
 
 
 class Paste(unittest.TestCase):
