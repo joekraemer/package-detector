@@ -88,6 +88,9 @@ class Config:
     # A camera that notified less than this long ago stays quiet on its next
     # arrival, so a package flickering in and out cannot spam the phone.
     ha_notify_cooldown_seconds: int = 1800
+    # Any short value. Changing it re-sends the "Package alerts are on" push
+    # once, to test the notification path without a package.
+    ha_notify_test: str = ""
 
 
 def parse_cameras(value: str) -> list[Camera]:
@@ -181,6 +184,14 @@ def _env_bool(env: dict, key: str) -> bool:
 
 
 NOTIFY_RE = re.compile(r"^notify\.[a-z0-9_]+$")
+TOKEN_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
+
+
+def _env_token(env: dict, key: str) -> str:
+    raw = env.get(key, "").strip()
+    if raw and not TOKEN_RE.match(raw):
+        raise ConfigError(f"{key} must be 1-64 letters, digits, '.', '_' or '-', got {raw!r}")
+    return raw
 
 
 def parse_notify(value: str) -> list[str]:
@@ -222,6 +233,7 @@ def load_config(env: dict | None = None, require_ha: bool = False) -> Config:
         ha_dry_run=_env_bool(env, "HA_DRY_RUN"),
         ha_notify=parse_notify(env.get("HA_NOTIFY", "")),
         ha_notify_cooldown_seconds=_env_int(env, "HA_NOTIFY_COOLDOWN_SECONDS", 1800, 0, 86400),
+        ha_notify_test=_env_token(env, "HA_NOTIFY_TEST"),
     )
     if require_ha and not cfg.ha_dry_run and (not cfg.ha_url or not cfg.ha_token):
         raise ConfigError("live run needs HA_URL and HA_TOKEN (not needed for --check/--dry-run)")
@@ -598,6 +610,9 @@ def _notify_hello(cfg: Config, conn: sqlite3.Connection) -> int:
     db: restarts and image updates stay quiet; changing HA_NOTIFY says hello
     again. A failure is logged and retried on the next poll."""
     want = ",".join(cfg.ha_notify)
+    if cfg.ha_notify_test:
+        # Changing HA_NOTIFY_TEST (e.g. to today's date) sends it once more.
+        want += f"|test={cfg.ha_notify_test}"
     row = conn.execute("SELECT value FROM meta WHERE key='notify_hello'").fetchone()
     if row and row[0] == want:
         return 0
