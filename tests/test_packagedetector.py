@@ -2,6 +2,7 @@
 No camera, no model, no network. Run: python -m unittest discover -s tests
 """
 
+import io
 import json
 import os
 import shutil
@@ -9,6 +10,7 @@ import sys
 import tempfile
 import time
 import unittest
+from datetime import datetime, timedelta
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -181,7 +183,7 @@ class TestPollOnce(unittest.TestCase):
         self.posts = []
         self.ha_err = [""]
 
-        def capture(url, timeout):
+        def capture(url, timeout, source="ffmpeg"):
             fd, path = tempfile.mkstemp(suffix=".jpg", dir=self.dir)
             os.write(fd, b"jpg")
             os.close(fd)
@@ -281,7 +283,7 @@ class TestClassifier(unittest.TestCase):
         self.p = [0.9]
         self.posts = []
 
-        def capture(url, timeout):
+        def capture(url, timeout, source="ffmpeg"):
             fd, path = tempfile.mkstemp(suffix=".jpg", dir=self.dir)
             os.close(fd)
             return path, ""
@@ -373,7 +375,7 @@ class TestNotify(unittest.TestCase):
         self.push_err = [""]
         self.clock = [1_000_000.0]
 
-        def capture(url, timeout):
+        def capture(url, timeout, source="ffmpeg"):
             fd, path = tempfile.mkstemp(suffix=".jpg", dir=self.dir)
             os.close(fd)
             return path, ""
@@ -503,6 +505,126 @@ class TestNotify(unittest.TestCase):
         self.assertIn("3:04 PM", p["message"])
         self.assertIn("0.97", p["message"])
         self.assertEqual(p["data"]["tag"], "package-doorbell")
+
+
+class TestUncertainFrames(unittest.TestCase):
+    """save_uncertain: band, rate limit kept in the db, capture.py layout."""
+
+    META = TestClassifier.META
+    setUp = TestClassifier.setUp
+    cfg = TestClassifier.cfg
+
+    def index_rows(self):
+        rows = []
+        for root, _, files in os.walk(os.path.join(self.dir, "frames")):
+            if "index.jsonl" in files:
+                with open(os.path.join(root, "index.jsonl")) as fh:
+                    rows += [json.loads(line) for line in fh]
+        return rows
+
+    def test_band_and_layout(self):
+        cfg = self.cfg()
+        for p in (0.39, 0.8, 0.95, 0.1):  # outside [0.4, 0.8)
+            self.p[0] = p
+            pd.poll_once(cfg)
+        self.assertEqual(self.index_rows(), [])
+        self.p[0] = 0.62
+        pd.poll_once(cfg)
+        rows = self.index_rows()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["reason"], "uncertain")
+        self.assertEqual(rows[0]["camera"], "porch")
+        self.assertEqual(rows[0]["p"], 0.62)
+        self.assertRegex(rows[0]["file"], r"^\d{4}-\d\d-\d\d/porch/\d{6}_uncertain\.jpg$")
+        self.assertTrue(os.path.isfile(os.path.join(self.dir, "frames", rows[0]["file"])))
+
+    def test_rate_limited_across_restarts(self):
+        cfg = self.cfg()
+        self.p[0] = 0.5
+        pd.poll_once(cfg)
+        pd.poll_once(self.cfg())  # a fresh config/process: the limit lives in the db
+        self.assertEqual(len(self.index_rows()), 1)
+        conn = pd.init_db(self.dir)
+        later = datetime.now().astimezone() + timedelta(seconds=601)
+        snap = os.path.join(self.dir, "x.jpg")
+        open(snap, "w").close()
+        self.assertIsNotNone(pd.save_uncertain(cfg, conn, "porch", snap, 0.5, when=later))
+        conn.close()
+
+    def test_off_and_dry_run_save_nothing(self):
+        self.p[0] = 0.6
+        pd.poll_once(self.cfg(UNCERTAIN_EVERY_SECONDS="0"))
+        pd.poll_once(self.cfg(), dry_run=True)
+        self.assertEqual(self.index_rows(), [])
+
+    def test_band_must_be_ordered(self):
+        with self.assertRaises(ConfigError):
+            self.cfg(UNCERTAIN_LOW="0.8", UNCERTAIN_HIGH="0.4")
+
+
+class TestReolinkSnapshot(unittest.TestCase):
+    URL = "rtsp://admin:p%40ss%26w=rd@192.168.0.26:554/h264Preview_04_sub"
+
+    def test_request_from_rtsp_url(self):
+        endpoint, params = pd.reolink_snap_request(self.URL)
+        self.assertEqual(endpoint, "https://192.168.0.26/cgi-bin/api.cgi")
+        self.assertEqual(params["cmd"], "Snap")
+        self.assertEqual(params["channel"], 3)  # Preview_04 is the 4th channel, 0-based 3
+        self.assertEqual((params["user"], params["password"]), ("admin", "p@ss&w=rd"))
+        self.assertEqual(pd.reolink_snap_request("rtsp://a:b@h/Preview_01_sub")[1]["channel"], 0)
+        with self.assertRaises(ValueError):
+            pd.reolink_snap_request("rtsp://a:b@h/live/stream1")
+
+    def _resp(self, body, ctype="image/jpeg", status=200):
+        r = mock.Mock(status_code=status, content=body, headers={"content-type": ctype})
+        return r
+
+    def test_downscales_to_training_width(self):
+        try:
+            from PIL import Image
+            import requests  # noqa: F401
+        except ImportError as exc:
+            self.skipTest(f"needs Pillow/requests: {exc}")
+        buf = io.BytesIO()
+        Image.new("RGB", (2560, 1920), (10, 20, 30)).save(buf, "JPEG")
+        with mock.patch("requests.get", return_value=self._resp(buf.getvalue())) as get:
+            path, err = pd.reolink_snapshot(self.URL, 5)
+        self.addCleanup(os.unlink, path)
+        self.assertEqual(err, "")
+        self.assertEqual(get.call_args.kwargs["verify"], False)
+        with Image.open(path) as im:
+            self.assertEqual(im.size, (640, 480))
+
+    def test_errors_never_carry_the_password(self):
+        try:
+            import requests
+        except ImportError as exc:
+            self.skipTest(f"needs requests: {exc}")
+        boom = requests.ConnectionError("Max retries ...?password=p@ss&w=rd&user=admin")
+        with mock.patch("requests.get", side_effect=boom):
+            path, err = pd.reolink_snapshot(self.URL, 5)
+        self.assertIsNone(path)
+        self.assertEqual(err, "reolink snapshot failed: ConnectionError")
+        with mock.patch("requests.get", return_value=self._resp(b"<html>", "text/html")):
+            path, err = pd.reolink_snapshot(self.URL, 5)
+        self.assertIsNone(path)
+        self.assertIn("not an image", err)
+
+    def test_falls_back_to_ffmpeg(self):
+        with mock.patch.object(pd, "reolink_snapshot", return_value=(None, "reolink snapshot failed")), \
+             mock.patch.object(pd, "_ffmpeg_snapshot", return_value=("/tmp/f.jpg", "")) as ff:
+            self.assertEqual(pd.capture_snapshot(self.URL, 5, "reolink"), ("/tmp/f.jpg", ""))
+            ff.assert_called_once()
+        with mock.patch.object(pd, "reolink_snapshot") as snap, \
+             mock.patch.object(pd, "_ffmpeg_snapshot", return_value=("/tmp/f.jpg", "")):
+            pd.capture_snapshot(self.URL, 5)  # default ffmpeg never tries the API
+            snap.assert_not_called()
+
+    def test_source_is_validated(self):
+        self.assertEqual(load_config({"CAMERAS": "a=rtsp://x", "SNAPSHOT_SOURCE": "Reolink"})
+                         .snapshot_source, "reolink")
+        with self.assertRaises(ConfigError):
+            load_config({"CAMERAS": "a=rtsp://x", "SNAPSHOT_SOURCE": "http"})
 
 
 class TestClassifierInput(unittest.TestCase):

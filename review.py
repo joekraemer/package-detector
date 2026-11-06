@@ -257,7 +257,8 @@ kbd{background:#333;border-radius:3px;padding:0 4px}
  <strong>Package review</strong>
  <label>Camera <select id="cam"><option value="">all</option><option>doorbell</option><option>garage</option></select></label>
  <label>Reason <select id="reason"><option value="">all</option><option>baseline</option><option>arrive</option>
-   <option>after_30s</option><option>after_120s</option></select></label>
+   <option>during_3s</option><option>during_7s</option><option>during_15s</option>
+   <option>after_30s</option><option>after_120s</option><option>uncertain</option></select></label>
  <label><input type="checkbox" id="unlab" checked> unlabelled only</label>
  <span id="count"></span> <a href="zones" style="color:#4ea1ff">draw zones</a>
  <span style="margin-left:auto"><kbd>j</kbd>/<kbd>k</kbd> move · <kbd>p</kbd> package · <kbd>e</kbd> empty ·

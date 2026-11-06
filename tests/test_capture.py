@@ -48,6 +48,19 @@ class TestConfig(unittest.TestCase):
         with self.assertRaises(ConfigError):
             parse_triggers("doorbell=sensor.x", ["doorbell"])
 
+    def test_during_seconds_and_source(self):
+        cfg = load_capture_config({"CAMERAS": CAMS})
+        self.assertEqual(cfg.during_seconds, (3, 7, 15))
+        self.assertEqual(cfg.snapshot_source, "ffmpeg")
+        cfg = load_capture_config({"CAMERAS": CAMS, "CAPTURE_DURING_SECONDS": "",
+                                   "SNAPSHOT_SOURCE": "reolink"})
+        self.assertEqual(cfg.during_seconds, ())  # empty turns them off
+        self.assertEqual(cfg.snapshot_source, "reolink")
+        for bad in ({"CAPTURE_DURING_SECONDS": "3,x"}, {"CAPTURE_DURING_SECONDS": "0"},
+                    {"SNAPSHOT_SOURCE": "nvr"}):
+            with self.assertRaises(ConfigError):
+                load_capture_config({"CAMERAS": CAMS, **bad})
+
     def test_after_seconds_sorted_and_bounded(self):
         cfg = load_capture_config({"CAMERAS": CAMS, "CAPTURE_AFTER_SECONDS": "120, 30"})
         self.assertEqual(cfg.after_seconds, (30, 120))
@@ -106,6 +119,25 @@ class TestTracker(unittest.TestCase):
         later = t.due(260)
         self.assertEqual([s.reason for s in later], ["after_120s"])
         self.assertEqual(later[0].event, arrive[0].event)
+
+    def test_during_shots_follow_the_arrival(self):
+        t = TriggerTracker((30, 120), 12, (3, 7, 15))
+        t.update("doorbell", "off", 0)
+        arrive = t.update("doorbell", "on", 100)
+        self.assertEqual(t.due(102.9), [])
+        self.assertEqual([s.reason for s in t.due(103)], ["during_3s"])
+        t.update("doorbell", "off", 105)  # quick drop-off: the visit is still shot
+        self.assertEqual([s.reason for s in t.due(115)], ["during_7s", "during_15s"])
+        self.assertEqual([s.reason for s in t.due(135)], ["after_30s"])
+        self.assertEqual({s.event for s in t.due(1000)}, {arrive[0].event})
+
+    def test_during_shots_skipped_for_capped_and_replaced_on_return(self):
+        t = TriggerTracker((30,), 1, (3, 7))
+        t.update("doorbell", "off", 0)
+        t.update("doorbell", "on", 10)
+        t.update("doorbell", "off", 11)
+        t.update("doorbell", "on", 12)  # back at once, and over the cap of 1/hour
+        self.assertEqual(t.due(1000), [])  # the first visit's shots were dropped
 
     def test_return_cancels_pending_afters(self):
         t = TriggerTracker((30, 120), 12)
@@ -172,7 +204,7 @@ class TestTake(unittest.TestCase):
         self.cfg = load_capture_config({"CAMERAS": CAMS, "CAPTURE_DIR": self.dir,
                                         "CAPTURE_MIN_FREE_GB": "0"})
 
-    def fake_snapshot(self, url, timeout):
+    def fake_snapshot(self, url, timeout, source="ffmpeg"):
         fd, path = tempfile.mkstemp(suffix=".jpg")
         os.write(fd, b"\xff\xd8jpeg")
         os.close(fd)
@@ -194,6 +226,18 @@ class TestTake(unittest.TestCase):
         self.assertEqual(rows[0]["tag"], "brown-box")
         self.assertEqual(rows[0]["camera"], "doorbell")
         self.assertNotIn("rtsp", text)
+
+    def test_uses_configured_source(self):
+        self.cfg.snapshot_source = "reolink"
+        seen = []
+
+        def snap(url, timeout, source="ffmpeg"):
+            seen.append(source)
+            return self.fake_snapshot(url, timeout)
+
+        with mock.patch.object(capture.pd, "capture_snapshot", snap):
+            capture.take(self.cfg, self.cfg.cameras[0], "during_3s", "day", event="e1")
+        self.assertEqual(seen, ["reolink"])
 
     def test_low_disk_skips(self):
         self.cfg.min_free_gb = 1e12

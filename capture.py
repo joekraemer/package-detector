@@ -13,9 +13,13 @@ Three ways frames get taken:
   in and out of IR night mode, the frames the model most needs to see).
   Day/night comes from Home Assistant's sun.sun entity.
 - event: when a camera's trigger sensor (e.g. the doorbell's person
-  sensor) turns on, one "arrive" frame; when it turns off, one frame
-  per CAPTURE_AFTER_SECONDS (default 30 s and 120 s later). The
-  "after" frames are where a delivered package shows up.
+  sensor) turns on, one "arrive" frame, then one frame per
+  CAPTURE_DURING_SECONDS after it (default 3, 7 and 15 s: the courier
+  with the package, the case the model finds hardest). When the sensor
+  turns off, one frame per CAPTURE_AFTER_SECONDS (default 30 s and
+  120 s later): the package alone, which is what an alert decides on.
+  SNAPSHOT_SOURCE=reolink takes frames through the Reolink Snap API
+  (~1 s) instead of ffmpeg (~4 s), so the 3 s frame lands on time.
 - session: you stage packages and press Enter per shot; every frame is
   tagged with what is on the porch, so it labels itself.
 
@@ -66,9 +70,11 @@ class CaptureConfig:
     night_minutes: int = 60
     twilight_minutes: int = 10
     after_seconds: tuple[int, ...] = (30, 120)
+    during_seconds: tuple[int, ...] = (3, 7, 15)
     max_events_per_hour: int = 12
     min_free_gb: float = 5.0
     snapshot_timeout_s: int = 15
+    snapshot_source: str = "ffmpeg"
 
 
 def load_env_file(path: str, env: dict) -> None:
@@ -118,18 +124,28 @@ def _int(env: dict, key: str, default: int, lo: int, hi: int) -> int:
     return v
 
 
+def _seconds_list(env: dict, key: str, default: str, allow_empty: bool) -> tuple[int, ...]:
+    raw = env.get(key, default)
+    try:
+        vals = tuple(sorted({int(x) for x in raw.split(",") if x.strip()}))
+    except ValueError:
+        raise ConfigError(f"{key} must be integers, got {raw!r}") from None
+    if (not vals and not allow_empty) or (vals and (vals[0] < 1 or vals[-1] > 1800)):
+        raise ConfigError(f"{key} values must be 1..1800, got {raw!r}")
+    return vals
+
+
 def load_capture_config(env: dict) -> CaptureConfig:
     if not env.get("CAMERAS"):
         raise ConfigError("CAMERAS is not set")
     cameras = parse_cameras(env["CAMERAS"])
     names = [c.name for c in cameras]
-    after_raw = env.get("CAPTURE_AFTER_SECONDS", "30,120")
-    try:
-        after = tuple(sorted(int(x) for x in after_raw.split(",") if x.strip()))
-    except ValueError:
-        raise ConfigError(f"CAPTURE_AFTER_SECONDS must be integers, got {after_raw!r}") from None
-    if not after or after[0] < 1 or after[-1] > 1800:
-        raise ConfigError(f"CAPTURE_AFTER_SECONDS values must be 1..1800, got {after_raw!r}")
+    after = _seconds_list(env, "CAPTURE_AFTER_SECONDS", "30,120", allow_empty=False)
+    # Empty (CAPTURE_DURING_SECONDS=) turns the in-visit frames off.
+    during = _seconds_list(env, "CAPTURE_DURING_SECONDS", "3,7,15", allow_empty=True)
+    source = env.get("SNAPSHOT_SOURCE", "").strip().lower() or "ffmpeg"
+    if source not in pd.SNAPSHOT_SOURCES:
+        raise ConfigError(f"SNAPSHOT_SOURCE must be one of {pd.SNAPSHOT_SOURCES}, got {source!r}")
     try:
         min_free = float(env.get("CAPTURE_MIN_FREE_GB", "5"))
     except ValueError:
@@ -144,6 +160,8 @@ def load_capture_config(env: dict) -> CaptureConfig:
         night_minutes=_int(env, "CAPTURE_NIGHT_MINUTES", 60, 1, 720),
         twilight_minutes=_int(env, "CAPTURE_TWILIGHT_MINUTES", 10, 1, 120),
         after_seconds=after,
+        during_seconds=during,
+        snapshot_source=source,
         max_events_per_hour=_int(env, "CAPTURE_MAX_EVENTS_PER_HOUR", 12, 1, 120),
         min_free_gb=min_free,
         snapshot_timeout_s=_int(env, "SNAPSHOT_TIMEOUT_S", 15, 3, 120),
@@ -201,9 +219,12 @@ class Shot:
 class TriggerTracker:
     """Turns trigger-sensor states into planned shots. Pure: no I/O.
 
-    on  (from off)  -> an 'arrive' shot now, and any pending 'after'
-                       shots for that camera are dropped (the person
-                       came back; the visit is not over yet).
+    on  (from off)  -> an 'arrive' shot now plus one 'during_<N>s' shot
+                       per during_seconds after it, and any pending
+                       'after' shots for that camera are dropped (the
+                       person came back; the visit is not over yet).
+                       'during' shots are taken even if the sensor turns
+                       off first: a quick drop-off is still a visit.
     off (from on)   -> one 'after_<N>s' shot per CAPTURE_AFTER_SECONDS.
     unavailable/unknown/None leave the remembered state alone, so a
     sensor blipping through 'unavailable' does not fake a visit.
@@ -213,8 +234,10 @@ class TriggerTracker:
     sensor in a windstorm would otherwise fill the disk); the 'after'
     shots of a capped arrival are skipped too."""
 
-    def __init__(self, after_seconds: tuple[int, ...], max_per_hour: int):
+    def __init__(self, after_seconds: tuple[int, ...], max_per_hour: int,
+                 during_seconds: tuple[int, ...] = ()):
         self.after_seconds = after_seconds
+        self.during_seconds = during_seconds
         self.max_per_hour = max_per_hour
         self.state: dict[str, str] = {}
         self.arrivals: dict[str, deque] = {}
@@ -242,6 +265,8 @@ class TriggerTracker:
             hist.append(now)
             eid = time.strftime("%Y%m%dT%H%M%S", time.localtime(now))
             self.event_id[camera] = eid
+            for s in self.during_seconds:
+                self.pending.append(Shot(now + s, camera, f"during_{s}s", eid))
             return [Shot(now, camera, "arrive", eid)]
         eid = self.event_id.get(camera)
         if eid is None:
@@ -321,7 +346,7 @@ def take(cfg: CaptureConfig, camera: Camera, reason: str, phase: str,
     if free_gb(cfg.capture_dir) < cfg.min_free_gb:
         log.warning("less than %.1f GB free in %s; not capturing", cfg.min_free_gb, cfg.capture_dir)
         return None
-    tmp, err = pd.capture_snapshot(camera.url, cfg.snapshot_timeout_s)
+    tmp, err = pd.capture_snapshot(camera.url, cfg.snapshot_timeout_s, cfg.snapshot_source)
     if tmp is None:
         log.warning("%s: %s", camera.name, err)
         return None
@@ -375,12 +400,15 @@ def cmd_check(cfg: CaptureConfig) -> int:
     for cam in cfg.cameras:
         if cam.name not in cfg.triggers:
             print(f"note {cam.name}: no trigger configured, baseline frames only")
-        tmp, err = pd.capture_snapshot(cam.url, cfg.snapshot_timeout_s)
+        t0 = time.monotonic()
+        tmp, err = pd.capture_snapshot(cam.url, cfg.snapshot_timeout_s, cfg.snapshot_source)
+        took = time.monotonic() - t0
         if tmp is None:
             print(f"FAIL {cam.name}: {err}")
             ok = False
         else:
-            print(f"ok {cam.name}: frame {os.path.getsize(tmp) // 1024} KB")
+            print(f"ok {cam.name}: frame {os.path.getsize(tmp) // 1024} KB in {took:.1f}s "
+                  f"via {cfg.snapshot_source}")
             os.unlink(tmp)
     return 0 if ok else 1
 
@@ -389,7 +417,7 @@ def cmd_run(cfg: CaptureConfig) -> int:
     ha = HomeAssistant(cfg.ha_url, cfg.ha_token)
     if not ha.configured:
         log.warning("HA_URL/HA_TOKEN not set: baseline only, day interval")
-    tracker = TriggerTracker(cfg.after_seconds, cfg.max_events_per_hour)
+    tracker = TriggerTracker(cfg.after_seconds, cfg.max_events_per_hour, cfg.during_seconds)
     by_name = {c.name: c for c in cfg.cameras}
     sun, sun_at = None, 0.0
     last_baseline: float | None = None

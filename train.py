@@ -53,6 +53,9 @@ IMGSZ = 224
 VAL_POS_SHARE = 0.3
 NEG_PER_POS = 4  # cap negatives at this many per (real + pasted) positive
 PASTES = 300
+# Frames saved because the deployed model was unsure (packagedetector.py
+# save_uncertain): never auto-labelled "empty", they wait for a human label.
+REVIEW_ONLY_REASONS = ("uncertain",)
 
 
 # ------------------------------------------------------------ labelling
@@ -87,6 +90,8 @@ def resolve_labels(rows: list[dict], human: dict[str, str],
             continue  # unsure: leave out
         if r["reason"] == "session":
             out[f] = "empty" if r.get("tag") == "empty" else "package"
+        elif r["reason"] in REVIEW_ONLY_REASONS:
+            continue  # the model was unsure: only a human label counts
         elif (r["camera"], f[:10]) not in session_days:
             out[f] = "empty"
     return out
