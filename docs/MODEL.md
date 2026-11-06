@@ -37,11 +37,20 @@ python capture.py session --tag empty        # staged shots: Enter = shoot, 't <
   within 45 min of sunrise/sunset (IR night-mode switch). About 40-50
   frames per camera per day, so night is represented without flooding
   the labelling queue with empty dark frames.
-- **Events**: trigger on -> `arrive` frame; trigger off -> `after_30s`
-  and `after_120s` frames, all sharing one `event` id. Deliveries are a
+- **Events**: trigger on -> `arrive` frame, then `during_3s`,
+  `during_7s` and `during_15s` (CAPTURE_DURING_SECONDS: the courier
+  standing over the package, the case the model finds hardest); trigger
+  off -> `after_30s` and `after_120s` frames, all sharing one `event`
+  id. With `SNAPSHOT_SOURCE=reolink` a frame takes ~1 s, so the 3 s
+  frame lands on time; ffmpeg takes 4-6 s per frame. Deliveries are a
   person visit, so nearly every real positive comes from the `after`
   frames, and the last baseline before `arrive` is the "before" frame.
   Capped at 12 visits per camera per rolling hour.
+- **Uncertain** (from the detector, not capture.py): a raw frame
+  whenever the deployed model scores 0.4-0.8, at most one per camera
+  per 10 min, in the detector's `DATA_DIR/frames`. Copy those days in
+  next to capture.py's (the file names cannot collide) and label them on
+  the review page (Reason: uncertain); training ignores them until then.
 - **Sessions**: stage packages, tag what is in the zone
   (`brown-box-door`, `white-mailer-mat`, `bag-step`, `empty`), press
   Enter per layout. Session frames label themselves from the tag.

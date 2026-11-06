@@ -162,7 +162,10 @@ the exit code.
 | `HA_NOTIFY` | (unset = no pushes) | Home Assistant notify services to call when a package **arrives**, comma separated, e.g. `notify.mobile_app_joes_iphone`. One push per arrival; a failed push is retried while the package is still there. Not sent while `HA_DRY_RUN=1` (logged as "would notify" instead). The first live poll with a new `HA_NOTIFY` value sends one "Package alerts are on" push, so you know the path works |
 | `HA_NOTIFY_COOLDOWN_SECONDS` | `1800` | after a push, the same camera's next arrival within this many seconds stays quiet (0..86400, 0 = no cooldown), so a package flickering in and out can't spam the phone |
 | `DATA_DIR` | `/data` | SQLite db + evidence snapshots |
-| `SNAPSHOT_TIMEOUT_S` | `15` | ffmpeg snapshot timeout per camera |
+| `SNAPSHOT_TIMEOUT_S` | `15` | snapshot timeout per camera |
+| `SNAPSHOT_SOURCE` | `ffmpeg` | `ffmpeg` grabs a frame from the RTSP sub-stream (~4-6 s, it waits for a keyframe). `reolink` asks the Reolink NVR/camera's HTTP Snap API on the same host and login as the RTSP URL (~1 s), downscales it to 640 px, and falls back to ffmpeg if that fails. HTTPS without certificate checks: Reolink devices only have a self-signed certificate. Errors never include the login |
+| `UNCERTAIN_LOW` / `UNCERTAIN_HIGH` | `0.4` / `0.8` | polls whose p(package) lands in this band keep their raw frame under `DATA_DIR/frames/<day>/<camera>/<HHMMSS>_uncertain.jpg`, indexed like capture.py frames. These are the frames worth labelling; `train.py` never auto-labels them |
+| `UNCERTAIN_EVERY_SECONDS` | `600` | at most one uncertain frame per camera this often (0 = off) |
 | `TZ` | `America/Los_Angeles` | timestamps |
 
 A bad value is a config error (`config error: ...`, exit code 2), same
@@ -171,7 +174,7 @@ convention as birdlisten. `--check` and `--dry-run` do not need
 
 ## How a poll works
 
-1. For each camera, in turn: grab one frame with ffmpeg.
+1. For each camera, in turn: grab one frame (ffmpeg, or the Reolink Snap API).
 2. Run the ONNX model on that frame (640 px input, CPU only).
 3. Drop detections below `CONFIDENCE`, and drop any whose centre is
    outside that camera's zone.
