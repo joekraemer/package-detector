@@ -121,6 +121,17 @@ docker run --rm -v fleet_package-detector-data:/d:ro alpine tar czf - -C /d fram
 # copy the images across
 ```
 
+**Label backup.** Labels exist only in `package-data/` on the training
+laptop, so `datasync.py` copies them, with the frames they cover, to a
+private sibling repo checkout `../package-detector-data` (override with
+`PACKAGE_DATA_REPO`; `PACKAGE_DATA_SYNC=0` turns it off) and commits and
+pushes. It runs on its own: `review.py serve` backs up 2 minutes after
+the last label and again on exit, and `train.py prepare` backs up before
+building a dataset. After editing `labels.jsonl` any other way, run
+`python datasync.py "data: <what changed>"`. A failed push is retried on
+the next run. The frames are camera images of the house and its
+visitors: they belong in that private repo only, never in this one.
+
 **Fixed test days.** `package-data/frames/test_days.json`
 (`{"doorbell": ["2026-11-05"]}`) lists days that never go to training or
 validation. Validation moves to the newest quiet day on every retrain,

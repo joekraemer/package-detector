@@ -182,6 +182,18 @@ class EndToEnd(unittest.TestCase):
         urllib.request.urlopen(req)
         self.assertEqual(review.read_labels(self.data / "labels.jsonl"), {top["file"]: "package"})
 
+        # A saved label schedules the data backup; a rejected one does not.
+        backups = []
+        srv.RequestHandlerClass = review.make_handler(self.data, port, nz, on_label=lambda: backups.append(1))
+        urllib.request.urlopen(urllib.request.Request(
+            base + "/api/label", method="POST", headers={"Content-Type": "application/json"},
+            data=json.dumps({"file": top["file"], "label": "empty"}).encode()))
+        with self.assertRaises(urllib.error.HTTPError):
+            urllib.request.urlopen(urllib.request.Request(
+                base + "/api/label", method="POST", headers={"Content-Type": "application/json"},
+                data=json.dumps({"file": top["file"], "label": "maybe"}).encode()))
+        self.assertEqual(backups, [1])
+
         # Path traversal and foreign Host headers are refused.
         with self.assertRaises(urllib.error.HTTPError) as e:
             urllib.request.urlopen(base + "/img/..%2f..%2fetc%2fpasswd")
