@@ -109,6 +109,40 @@ VIRTUAL_ENV=.venv-train uv pip install -r requirements-train.txt
 .venv-train/bin/python train.py export    # ONNX only, from the last best.pt
 ```
 
+The detector's uncertain frames and poll log live in its own volume.
+Merge its frames in next to capture.py's (the `_uncertain` file names
+cannot collide; both append to the same per-day `index.jsonl` layout,
+so append rather than overwrite) and copy the db for `replay.py`:
+
+```text
+docker run --rm -v fleet_package-detector-data:/d:ro alpine tar czf - -C /d frames package-detector.sqlite > ~/detector-data.tgz
+# laptop: unpack into package-data/detector/, then append each
+# detector/frames/<day>/index.jsonl to frames/<day>/index.jsonl and
+# copy the images across
+```
+
+**Fixed test days.** `package-data/frames/test_days.json`
+(`{"doorbell": ["2026-11-05"]}`) lists days that never go to training or
+validation. Validation moves to the newest quiet day on every retrain,
+so only the test days give numbers comparable across models. Add a day
+once it is labelled, typically one with a real delivery or a new kind of
+false alarm. A model trained on a day before it became a test day has
+seen it, so its score there is not a fair one.
+
+```text
+.venv-train/bin/python train.py compare models/a.onnx models/b.onnx --cutoff 0.5 --cutoff 0.7
+```
+
+**Alert replay.** `replay.py` replays the service's alert rules over the
+poll log at several cutoffs: alerts true / false / unverified against
+the labelled frames, false alerts per day, deliveries caught, and the
+uncertain stretches by light and hour. It measures the model that was
+deployed when the polls were taken.
+
+```text
+.venv-train/bin/python replay.py --cutoff 0.7 --cutoff 0.8
+```
+
 Package boxes for copy-paste live in `package-data/boxes.json`
 (`{file: [x0, y0, x1, y1]}`, frame fractions). The service must
 preprocess exactly like training: crop the zone, stretch it to a
