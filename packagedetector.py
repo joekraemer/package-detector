@@ -20,6 +20,7 @@ Usage (see README for the docker form):
 from __future__ import annotations
 
 import argparse
+import io
 import json
 import logging
 import os
@@ -30,6 +31,8 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.parse
+import warnings
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
@@ -91,6 +94,22 @@ class Config:
     # Any short value. Changing it re-sends the "Package alerts are on" push
     # once, to test the notification path without a package.
     ha_notify_test: str = ""
+    # "ffmpeg" (RTSP grab) or "reolink" (Snap API, ffmpeg as fallback).
+    snapshot_source: str = "ffmpeg"
+    # Frames the classifier is unsure about are the most useful training
+    # data: polls with uncertain_low <= p < uncertain_high are saved raw
+    # under DATA_DIR/frames, at most one per camera per uncertain_every_s.
+    # uncertain_every_s = 0 turns it off.
+    uncertain_low: float = 0.4
+    uncertain_high: float = 0.8
+    uncertain_every_s: int = 600
+
+
+def _env_source(env: dict) -> str:
+    raw = env.get("SNAPSHOT_SOURCE", "").strip().lower() or "ffmpeg"
+    if raw not in SNAPSHOT_SOURCES:
+        raise ConfigError(f"SNAPSHOT_SOURCE must be one of {SNAPSHOT_SOURCES}, got {raw!r}")
+    return raw
 
 
 def parse_cameras(value: str) -> list[Camera]:
@@ -234,7 +253,14 @@ def load_config(env: dict | None = None, require_ha: bool = False) -> Config:
         ha_notify=parse_notify(env.get("HA_NOTIFY", "")),
         ha_notify_cooldown_seconds=_env_int(env, "HA_NOTIFY_COOLDOWN_SECONDS", 1800, 0, 86400),
         ha_notify_test=_env_token(env, "HA_NOTIFY_TEST"),
+        snapshot_source=_env_source(env),
+        uncertain_low=_env_float(env, "UNCERTAIN_LOW", 0.4),
+        uncertain_high=_env_float(env, "UNCERTAIN_HIGH", 0.8),
+        uncertain_every_s=_env_int(env, "UNCERTAIN_EVERY_SECONDS", 600, 0, 86400),
     )
+    if cfg.uncertain_low >= cfg.uncertain_high:
+        raise ConfigError(f"UNCERTAIN_LOW ({cfg.uncertain_low}) must be < "
+                          f"UNCERTAIN_HIGH ({cfg.uncertain_high})")
     if require_ha and not cfg.ha_dry_run and (not cfg.ha_url or not cfg.ha_token):
         raise ConfigError("live run needs HA_URL and HA_TOKEN (not needed for --check/--dry-run)")
     return cfg
@@ -274,10 +300,88 @@ def update_state(present: bool, hits: int, misses: int, detected: bool,
 
 # ---------------------------------------------------------------- capture
 
-def capture_snapshot(url: str, timeout_s: int) -> tuple[str | None, str]:
-    """One frame via ffmpeg from the RTSP sub-stream. Returns
-    (temp JPEG path, error string). On success the caller deletes the
-    file; on failure it is already gone. Errors never contain credentials."""
+SNAPSHOT_SOURCES = ("ffmpeg", "reolink")
+SNAP_WIDTH = 640  # the sub-stream width every training frame so far has
+_REOLINK_CHANNEL_RE = re.compile(r"Preview_(\d+)_")
+
+
+def reolink_snap_request(url: str) -> tuple[str, dict]:
+    """The Reolink HTTP API request equivalent to an RTSP camera URL:
+    same host and login, channel from `Preview_NN_` (NN is 1-based).
+    Raises ValueError if the URL does not name a channel."""
+    u = urllib.parse.urlsplit(url)
+    m = _REOLINK_CHANNEL_RE.search(u.path)
+    if not u.hostname or not m:
+        raise ValueError("RTSP URL has no Reolink Preview_NN channel")
+    params = {"cmd": "Snap", "channel": int(m.group(1)) - 1, "rs": f"{time.time():.3f}",
+              "user": urllib.parse.unquote(u.username or ""),
+              "password": urllib.parse.unquote(u.password or "")}
+    return f"https://{u.hostname}/cgi-bin/api.cgi", params
+
+
+def reolink_snapshot(url: str, timeout_s: int) -> tuple[str | None, str]:
+    """One frame from the Reolink NVR/camera's Snap API: ~1 s, against ~4 s
+    for an ffmpeg RTSP grab (which has to wait for a keyframe). The JPEG
+    is main-stream resolution; it is downscaled to SNAP_WIDTH so frames
+    keep the size the model was trained on. TLS is not verified: Reolink
+    devices only have a self-signed certificate, and this runs on the LAN.
+    The login travels as query parameters (Reolink's API has no other
+    one-shot form), so errors report the exception CLASS only: requests
+    puts the full URL, password included, in its messages."""
+    import requests  # lazy: see module docstring
+    from PIL import Image
+    try:
+        endpoint, params = reolink_snap_request(url)
+    except ValueError as exc:
+        return None, f"reolink snapshot: {exc}"
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")  # InsecureRequestWarning, see above
+            resp = requests.get(endpoint, params=params, timeout=timeout_s, verify=False)
+    except requests.RequestException as exc:
+        return None, f"reolink snapshot failed: {type(exc).__name__}"
+    if resp.status_code != 200 or not resp.headers.get("content-type", "").startswith("image/"):
+        return None, f"reolink snapshot failed: HTTP {resp.status_code}, not an image"
+    tmp = tempfile.NamedTemporaryFile(suffix=".jpg", delete=False)
+    tmp.close()
+    try:
+        with Image.open(io.BytesIO(resp.content)) as im:
+            im = im.convert("RGB")
+            if im.width > SNAP_WIDTH:
+                im = im.resize((SNAP_WIDTH, round(im.height * SNAP_WIDTH / im.width)), Image.BOX)
+            im.save(tmp.name, quality=92)
+    except Exception as exc:  # noqa: BLE001 — a bad JPEG is one failed frame
+        _remove(tmp.name)
+        return None, f"reolink snapshot: unreadable image ({type(exc).__name__})"
+    return tmp.name, ""
+
+
+def capture_snapshot(url: str, timeout_s: int, source: str = "ffmpeg") -> tuple[str | None, str]:
+    """One frame. Returns (temp JPEG path, error string). On success the
+    caller deletes the file; on failure it is already gone. Errors never
+    contain credentials. source="reolink" tries the Snap API first and
+    falls back to ffmpeg, so a firmware or login change costs speed, not
+    frames."""
+    if source == "reolink":
+        snap, err = reolink_snapshot(url, timeout_s)
+        if snap is not None:
+            return snap, ""
+        _warn_snap_fallback(url, err)
+    return _ffmpeg_snapshot(url, timeout_s)
+
+
+_snap_fallback_warned: set[str] = set()
+
+
+def _warn_snap_fallback(url: str, err: str) -> None:
+    key = urllib.parse.urlsplit(url).path
+    if key not in _snap_fallback_warned:  # once per camera, not every poll
+        _snap_fallback_warned.add(key)
+        log.warning("%s; falling back to ffmpeg", err)
+
+
+def _ffmpeg_snapshot(url: str, timeout_s: int) -> tuple[str | None, str]:
+    """One frame via ffmpeg from the RTSP sub-stream."""
     if shutil.which("ffmpeg") is None:
         return None, "ffmpeg not found"
     tmp = tempfile.NamedTemporaryFile(suffix=".jpg", delete=False)
@@ -671,7 +775,7 @@ def poll_once(cfg: Config, dry_run: bool = False) -> int:
     if conn is not None and cfg.ha_notify and not cfg.ha_dry_run:
         rc |= _notify_hello(cfg, conn)
     for cam in cfg.cameras:
-        snap, err = capture_snapshot(cam.url, cfg.snapshot_timeout_s)
+        snap, err = capture_snapshot(cam.url, cfg.snapshot_timeout_s, cfg.snapshot_source)
         if snap is None:
             log.error("camera %s: %s", cam.name, err)
             rc = 1
@@ -684,6 +788,35 @@ def poll_once(cfg: Config, dry_run: bool = False) -> int:
     if conn is not None:
         conn.close()
     return rc
+
+
+def save_uncertain(cfg: Config, conn: sqlite3.Connection, camera: str, snap: str, p: float,
+                   when: datetime | None = None) -> str | None:
+    """Keep the raw frame (no overlay, unlike evidence/) when the model is
+    unsure, in capture.py's layout so the training tools read it as is:
+    DATA_DIR/frames/<day>/<camera>/<HHMMSS>_uncertain.jpg plus a row in
+    DATA_DIR/frames/<day>/index.jsonl. At most one per camera per
+    uncertain_every_s; the last save time lives in the db so restarts do
+    not reset it. Returns the saved path, or None."""
+    if not cfg.uncertain_every_s or not cfg.uncertain_low <= p < cfg.uncertain_high:
+        return None
+    when = when or datetime.now().astimezone()
+    key = f"uncertain_saved_{camera}"
+    row = conn.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+    if row and when.timestamp() - float(row[0]) < cfg.uncertain_every_s:
+        return None
+    day = when.strftime("%Y-%m-%d")
+    rel = f"{day}/{camera}/{when.strftime('%H%M%S')}_uncertain.jpg"
+    dest = os.path.join(cfg.data_dir, "frames", rel)
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    shutil.copyfile(snap, dest)
+    record = {"file": rel, "camera": camera, "ts": when.isoformat(timespec="seconds"),
+              "reason": "uncertain", "p": round(p, 3)}
+    with open(os.path.join(cfg.data_dir, "frames", day, "index.jsonl"), "a", encoding="utf-8") as fh:
+        fh.write(json.dumps(record) + "\n")
+    conn.execute("INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)", (key, str(when.timestamp())))
+    log.info("camera %s: p_package=%.3f is uncertain; frame kept as %s", camera, p, rel)
+    return dest
 
 
 def classifier_zone(cfg: Config, meta: dict, camera: str):
@@ -709,6 +842,8 @@ def _poll_camera(cfg: Config, conn: sqlite3.Connection | None, cam: Camera, snap
         detected, best = p >= cfg.confidence, round(p, 3)
         kept = [{"box": zone, "confidence": p}] if detected else []
         log.info("camera %s: p_package=%.3f detected=%s", cam.name, p, detected)
+        if conn is not None:
+            save_uncertain(cfg, conn, cam.name, snap, p)
     else:
         try:
             detections = detect(snap, cfg.model_path, cfg.confidence) if model_ok else []
@@ -808,7 +943,7 @@ def cmd_check(cfg: Config) -> int:
     else:
         print("notify: off (HA_NOTIFY unset; sensor only)")
     for cam in cfg.cameras:
-        snap, err = capture_snapshot(cam.url, cfg.snapshot_timeout_s)
+        snap, err = capture_snapshot(cam.url, cfg.snapshot_timeout_s, cfg.snapshot_source)
         if snap is None:
             problems.append(f"camera {cam.name}: {err}")
             print(f"camera {cam.name}: FAIL {err}")

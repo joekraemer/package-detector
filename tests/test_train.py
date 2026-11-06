@@ -51,6 +51,15 @@ class Labels(unittest.TestCase):
         self.assertEqual(got["2026-11-04/doorbell/122520_session.jpg"], "package")
         self.assertEqual(got["2026-11-04/doorbell/140000_session.jpg"], "empty")     # tag empty
 
+    def test_uncertain_frames_wait_for_a_human(self):
+        rows = [r("2026-11-02/doorbell/101500_uncertain.jpg", "uncertain"),
+                r("2026-11-02/doorbell/111500_uncertain.jpg", "uncertain"),
+                r("2026-11-02/doorbell/121500_during_3s.jpg", "during_3s")]
+        got = train.resolve_labels(rows, {"2026-11-02/doorbell/111500_uncertain.jpg": "package"})
+        self.assertNotIn("2026-11-02/doorbell/101500_uncertain.jpg", got)  # quiet day, still not "empty"
+        self.assertEqual(got["2026-11-02/doorbell/111500_uncertain.jpg"], "package")
+        self.assertEqual(got["2026-11-02/doorbell/121500_during_3s.jpg"], "empty")  # like any event frame
+
 
 class Split(unittest.TestCase):
     def test_val_day_keeps_its_real_delivery_and_newest_staged_go_to_val(self):
