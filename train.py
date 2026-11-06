@@ -247,6 +247,9 @@ def cmd_prepare(data: Path, out: Path, cameras: list[str] | None, seed: int) -> 
     if missing:
         print(f"no zone for {missing}: draw one on the review page (/zones) first", file=sys.stderr)
         return 1
+    if data.resolve() == DATA.resolve():
+        import datasync
+        print(datasync.backup())  # labels to the private data repo before training on them
     all_rows = review.load_index(data)
     human = review.read_labels(data / "labels.jsonl")
     staged = read_staged_days(data / "labels.jsonl")

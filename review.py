@@ -380,7 +380,7 @@ def sample_frames(data: Path) -> dict[str, str]:
     return out
 
 
-def make_handler(data: Path, port: int, zones_path: Path = ZONES_FILE):
+def make_handler(data: Path, port: int, zones_path: Path = ZONES_FILE, on_label=None):
     labels_path = data / "labels.jsonl"
     score_lock = threading.Lock()
     allowed_hosts = {f"127.0.0.1:{port}", f"localhost:{port}"}
@@ -458,6 +458,8 @@ def make_handler(data: Path, port: int, zones_path: Path = ZONES_FILE):
             with labels_path.open("a") as fh:
                 fh.write(json.dumps({"file": f, "label": label,
                                      "at": datetime.now().astimezone().isoformat(timespec="seconds")}) + "\n")
+            if on_label is not None:
+                on_label()  # schedules the debounced data backup; returns at once
             self._send(200, b"{}", "application/json")
 
         def _save_zones(self):
@@ -481,9 +483,25 @@ def cmd_serve(data: Path, port: int) -> int:
     if not (data / "scores.jsonl").is_file():
         print("run `python review.py score` first", file=sys.stderr)
         return 1
-    srv = ThreadingHTTPServer(("127.0.0.1", port), make_handler(data, port))
+    import datasync
+    # Labels are backed up to the private data repo 2 min after the last
+    # one, and on exit. Only for the checkout's own package-data: that is
+    # what the data repo's sync.py reads.
+    saver = None
+    if data.resolve() == DEFAULT_DATA.resolve():
+        saver = datasync.Debouncer(datasync.backup, delay_s=120, log=lambda m: print(m, flush=True))
+    srv = ThreadingHTTPServer(("127.0.0.1", port),
+                              make_handler(data, port, on_label=saver.schedule if saver else None))
     print(f"review page: http://127.0.0.1:{port}/  (labels -> {data / 'labels.jsonl'})")
-    srv.serve_forever()
+    print(datasync.backup() if saver else "data backup off: --data is not this checkout's package-data")
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        srv.server_close()
+        if saver:
+            saver.flush()
     return 0
 
 
