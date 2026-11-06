@@ -53,6 +53,7 @@ IMGSZ = 224
 VAL_POS_SHARE = 0.3
 NEG_PER_POS = 4  # cap negatives at this many per (real + pasted) positive
 PASTES = 300
+TEST_DAYS_FILE = "test_days.json"
 # Frames saved because the deployed model was unsure (packagedetector.py
 # save_uncertain): never auto-labelled "empty", they wait for a human label.
 REVIEW_ONLY_REASONS = ("uncertain",)
@@ -75,6 +76,38 @@ def read_staged_days(path: Path) -> set[tuple[str, str]]:
                     parts = r["file"].split("/")
                     out.add((parts[1], parts[0]))
     return out
+
+
+def read_test_days(data: Path) -> set[tuple[str, str]]:
+    """(camera, day) pairs held out of training AND validation for good.
+
+    `test_days.json` next to labels.jsonl: {"doorbell": ["2026-11-05"]}.
+    Validation moves to the newest quiet day on every retrain, so two
+    models trained a week apart were never scored on the same frames.
+    Test days stay put: every model is compared on them, and they never
+    teach anything. Add a day once its frames are labelled, typically a
+    day with a real delivery or a new kind of false alarm."""
+    path = data / TEST_DAYS_FILE
+    if not path.is_file():
+        return set()
+    return {(cam, day) for cam, days in json.loads(path.read_text()).items() for day in days}
+
+
+def hold_out(labels: dict[str, str], days: set[str]) -> tuple[dict[str, str], list[str]]:
+    """Drop test-day frames from training labels: (kept labels, held files)."""
+    held = sorted(f for f in labels if f[:10] in days)
+    return {f: l for f, l in labels.items() if f[:10] not in days}, held
+
+
+def test_labels(data: Path, camera: str, rows: list[dict] | None = None) -> dict[str, str]:
+    """file -> label for one camera's test days (same rules as training)."""
+    days = {d for c, d in read_test_days(data) if c == camera}
+    if not days:
+        return {}
+    rows = [r for r in (rows if rows is not None else review.load_index(data)) if r["camera"] == camera]
+    staged = {s for s in read_staged_days(data / "labels.jsonl") if s[0] == camera}
+    labels = resolve_labels(rows, review.read_labels(data / "labels.jsonl"), staged)
+    return {f: l for f, l in labels.items() if f[:10] in days}
 
 
 def resolve_labels(rows: list[dict], human: dict[str, str],
@@ -238,11 +271,15 @@ def cmd_prepare(data: Path, out: Path, cameras: list[str] | None, seed: int) -> 
         rows = [r for r in all_rows if r["camera"] == cam]
         cam_staged = {s for s in staged if s[0] == cam}
         labels = resolve_labels(rows, human, cam_staged)
+        test_days = {d for c, d in read_test_days(data) if c == cam}
+        labels, held = hold_out(labels, test_days)
+        if held:
+            print(f"{cam}: {len(held)} labelled frames on test days {sorted(test_days)} held out")
         sides = split(rows, labels, cam_staged, group=night_of)
         per_cam[cam] = (labels, sides)
         sides_all.update(sides)
     boxes = json.loads(BOXES.read_text()) if BOXES.is_file() else {}
-    cutout_files = sorted(f for f in boxes if sides_all.get(f) == "train")
+    cutout_files = sorted(f for f in boxes if sides_all.get(f) == "train")  # never a test day
     cutouts = [cutout(data / f, boxes[f]) for f in cutout_files]
 
     counts = Counter()
@@ -384,6 +421,9 @@ def cmd_export() -> int:
               f"false positives {c['empty', True]}/{c['empty', True] + c['empty', False]}")
         for w in wrong[:15]:
             print("  wrong:", w)
+    # 3. The fixed test days: the only numbers comparable across retrains.
+    if read_test_days(DATA):
+        cmd_compare(DATA, [dest], (0.5, 0.7))
     return 0
 
 
@@ -412,6 +452,54 @@ def evaluate(model, val_dir: Path, threshold: float = 0.5) -> dict:
             "false_positive_rate": round(fp / (fp + tn), 4) if fp + tn else None, "errors": errors}
 
 
+def score_models(data: Path, models: list[Path], cutoffs: tuple[float, ...]) -> dict:
+    """Frame-level scores of each model on the fixed test days, per camera.
+    Uses the service's own classify(), so preprocessing is the deployed one."""
+    import packagedetector
+
+    rows = review.load_index(data)
+    out: dict = {}
+    for cam in sorted({c for c, _ in read_test_days(data)}):
+        labels = test_labels(data, cam, rows)
+        if not labels:
+            continue
+        for model in models:
+            meta = packagedetector.load_model_meta(str(model))
+            zone = (meta or {}).get("cameras", {}).get(cam) if meta else None
+            if zone is None:
+                out.setdefault(cam, {})[model.name] = {"skipped": "model has no zone for this camera"}
+                continue
+            ps = {f: packagedetector.classify(str(data / f), str(model), tuple(zone), meta) for f in sorted(labels)}
+            res = {"n_package": sum(l == "package" for l in labels.values()),
+                   "n_empty": sum(l == "empty" for l in labels.values()),
+                   "max_empty_p": round(max((p for f, p in ps.items() if labels[f] == "empty"), default=0), 3)}
+            for c in cutoffs:
+                res[f"found@{c}"] = sum(labels[f] == "package" and p >= c for f, p in ps.items())
+                res[f"fp@{c}"] = sum(labels[f] == "empty" and p >= c for f, p in ps.items())
+            res["wrong@0.5"] = [(f, labels[f], round(p, 3)) for f, p in ps.items()
+                                if (p >= 0.5) != (labels[f] == "package")]
+            out.setdefault(cam, {})[model.name] = res
+    return out
+
+
+def cmd_compare(data: Path, models: list[Path], cutoffs: tuple[float, ...]) -> int:
+    if not read_test_days(data):
+        print(f"no {data / TEST_DAYS_FILE}: list the held-out days first", file=sys.stderr)
+        return 1
+    for cam, by_model in score_models(data, models, cutoffs).items():
+        print(f"== {cam} test days: {sorted(d for c, d in read_test_days(data) if c == cam)}")
+        for name, r in by_model.items():
+            if "skipped" in r:
+                print(f"  {name}: {r['skipped']}")
+                continue
+            cols = "  ".join(f"@{c}: found {r[f'found@{c}']}/{r['n_package']} FP {r[f'fp@{c}']}/{r['n_empty']}"
+                             for c in cutoffs)
+            print(f"  {name}: {cols}  max empty p {r['max_empty_p']}")
+            for w in r["wrong@0.5"][:10]:
+                print("    wrong@0.5:", w)
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--data", type=Path, default=DATA)
@@ -424,7 +512,13 @@ def main(argv: list[str] | None = None) -> int:
     f = sub.add_parser("fit")
     f.add_argument("--epochs", type=int, default=20)
     sub.add_parser("export")
+    c = sub.add_parser("compare", help="score models on the fixed test days")
+    c.add_argument("models", type=Path, nargs="+", help=".onnx files (each with its .json sidecar)")
+    c.add_argument("--cutoff", type=float, action="append",
+                   help="decision cutoffs to report (repeatable); default 0.5 and 0.7")
     a = ap.parse_args(argv)
+    if a.cmd == "compare":
+        return cmd_compare(a.data, a.models, tuple(a.cutoff or (0.5, 0.7)))
     if a.cmd == "prepare":
         return cmd_prepare(a.data, a.out, a.camera, a.seed)
     if a.cmd == "export":
