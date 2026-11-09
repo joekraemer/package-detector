@@ -94,6 +94,10 @@ class Config:
     # Any short value. Changing it re-sends the "Package alerts are on" push
     # once, to test the notification path without a package.
     ha_notify_test: str = ""
+    # Attach the camera frame to each push: uploaded to HA's media folder
+    # (needs an admin HA_TOKEN), sent as data.image. A failed upload still
+    # sends the push, just without the photo.
+    ha_notify_image: bool = True
     # "ffmpeg" (RTSP grab) or "reolink" (Snap API, ffmpeg as fallback).
     snapshot_source: str = "ffmpeg"
     # Frames the classifier is unsure about are the most useful training
@@ -193,9 +197,11 @@ def _env_float(env: dict, key: str, default: float) -> float:
     return val
 
 
-def _env_bool(env: dict, key: str) -> bool:
+def _env_bool(env: dict, key: str, default: bool = False) -> bool:
     raw = env.get(key, "").strip().lower()
-    if raw in ("", "0", "false", "no"):
+    if raw == "":
+        return default
+    if raw in ("0", "false", "no"):
         return False
     if raw in ("1", "true", "yes"):
         return True
@@ -253,6 +259,7 @@ def load_config(env: dict | None = None, require_ha: bool = False) -> Config:
         ha_notify=parse_notify(env.get("HA_NOTIFY", "")),
         ha_notify_cooldown_seconds=_env_int(env, "HA_NOTIFY_COOLDOWN_SECONDS", 1800, 0, 86400),
         ha_notify_test=_env_token(env, "HA_NOTIFY_TEST"),
+        ha_notify_image=_env_bool(env, "HA_NOTIFY_IMAGE", default=True),
         snapshot_source=_env_source(env),
         uncertain_low=_env_float(env, "UNCERTAIN_LOW", 0.4),
         uncertain_high=_env_float(env, "UNCERTAIN_HIGH", 0.8),
@@ -680,15 +687,61 @@ def post_to_ha(cfg: Config, camera: str, present: bool,
     return ""
 
 
-def notify_payload(camera: str, confidence: float | None, when: datetime | None = None) -> dict:
+def notify_payload(camera: str, confidence: float | None, when: datetime | None = None,
+                   image: str | None = None) -> dict:
     when = when or datetime.now()
     at = when.strftime("%I:%M %p").lstrip("0")
     place = camera.replace("_", " ")
     conf = f" (confidence {confidence:.2f})" if confidence is not None else ""
     # `tag` makes a newer alert for the same camera replace the older one.
+    data: dict = {"tag": f"package-{camera}"}
+    if image:
+        data["image"] = image
     return {"title": f"Package at the {place}",
             "message": f"A package showed up at the {place} at {at}{conf}.",
-            "data": {"tag": f"package-{camera}"}}
+            "data": data}
+
+
+# Pushed frames go to HA's local media folder, /media/<NOTIFY_MEDIA_DIR>/
+# on the HA host. The companion app fetches /media/local/... with its own
+# login, so the photo is never public (unlike /config/www).
+NOTIFY_MEDIA_DIR = "package-detector"
+
+
+def upload_notify_image(cfg: Config, snap: str, camera: str,
+                        when: datetime | None = None) -> tuple[str | None, str]:
+    """Upload one frame to HA's media source. Returns (the relative URL a
+    notification's data.image takes, "") or (None, error string). HA only
+    accepts uploads from an admin user's token."""
+    import requests  # lazy: see module docstring
+    when = when or datetime.now()
+    name = f"{camera}_{when.strftime('%Y%m%d_%H%M%S')}.jpg"
+    try:
+        with open(snap, "rb") as fh:
+            resp = requests.post(
+                f"{cfg.ha_url}/api/media_source/local_source/upload",
+                data={"media_content_id": f"media-source://media_source/local/{NOTIFY_MEDIA_DIR}"},
+                files={"file": (name, fh, "image/jpeg")},
+                headers={"Authorization": f"Bearer {cfg.ha_token}"},
+                timeout=15)
+        resp.raise_for_status()
+        content_id = resp.json()["media_content_id"]
+    except Exception as exc:  # noqa: BLE001 — a photo must never cost the push
+        hint = " (HA_TOKEN must belong to an admin user)" if "401" in str(exc) else ""
+        return None, f"image upload failed: {exc}{hint}"
+    prefix = "media-source://media_source/local/"
+    if not content_id.startswith(prefix):
+        return None, f"image upload returned an unexpected id: {content_id!r}"
+    return "/media/local/" + content_id[len(prefix):], ""
+
+
+def _notify_image(cfg: Config, snap: str | None, camera: str) -> str | None:
+    if not (cfg.ha_notify_image and snap):
+        return None
+    image, err = upload_notify_image(cfg, snap, camera)
+    if err:
+        log.warning("camera %s: %s; sending the push without a photo", camera, err)
+    return image
 
 
 def notify_ha(cfg: Config, payload: dict) -> str:
@@ -708,11 +761,13 @@ def notify_ha(cfg: Config, payload: dict) -> str:
     return "; ".join(failed)
 
 
-def _notify_hello(cfg: Config, conn: sqlite3.Connection) -> int:
+def _notify_hello(cfg: Config, conn: sqlite3.Connection, snap: str | None = None,
+                  camera: str | None = None) -> int:
     """One "alerts are on" push per HA_NOTIFY setting, so whoever turned
     alerts on gets proof on the phone that the path works. Stored in the
     db: restarts and image updates stay quiet; changing HA_NOTIFY says hello
-    again. A failure is logged and retried on the next poll."""
+    again. A failure is logged and retried on the next poll. With `snap`
+    it carries that camera's current frame, which tests the photo path."""
     want = ",".join(cfg.ha_notify)
     if cfg.ha_notify_test:
         # Changing HA_NOTIFY_TEST (e.g. to today's date) sends it once more.
@@ -721,9 +776,13 @@ def _notify_hello(cfg: Config, conn: sqlite3.Connection) -> int:
     if row and row[0] == want:
         return 0
     cams = ", ".join(c.name.replace("_", " ") for c in cfg.cameras)
+    data: dict = {"tag": "package-detector-hello"}
+    image = _notify_image(cfg, snap, camera or "hello")
+    if image:
+        data["image"] = image
     err = notify_ha(cfg, {"title": "Package alerts are on",
                           "message": f"You'll get a notification when a package shows up ({cams}).",
-                          "data": {"tag": "package-detector-hello"}})
+                          "data": data})
     if err:
         log.error("HA notify (alerts-on message) failed: %s (will retry next poll)", err)
         return 1
@@ -734,9 +793,10 @@ def _notify_hello(cfg: Config, conn: sqlite3.Connection) -> int:
 
 
 def _handle_notify(cfg: Config, cam: Camera, s: CamState, changed: bool, present: bool,
-                   confidence: float | None, epoch: float) -> int:
-    """Arrival -> one notification. Leaving clears a notification that has
-    not gone out yet; a failed one is retried while the package is there."""
+                   confidence: float | None, epoch: float, snap: str | None = None) -> int:
+    """Arrival -> one notification, with this poll's frame attached. Leaving
+    clears a notification that has not gone out yet; a failed one is retried
+    while the package is there (with that later poll's frame)."""
     if changed and present:
         s.notify_pending = True
     if not present:
@@ -749,7 +809,8 @@ def _handle_notify(cfg: Config, cam: Camera, s: CamState, changed: bool, present
                  cam.name, cfg.ha_notify_cooldown_seconds)
         s.notify_pending = False
         return 0
-    err = notify_ha(cfg, notify_payload(cam.name, confidence))
+    image = _notify_image(cfg, snap, cam.name)
+    err = notify_ha(cfg, notify_payload(cam.name, confidence, image=image))
     if err:
         log.error("camera %s: HA notify failed: %s (will retry next poll)", cam.name, err)
         return 1
@@ -772,8 +833,7 @@ def poll_once(cfg: Config, dry_run: bool = False) -> int:
         log.warning("model not found at %s; running capture-only (no detections)",
                     cfg.model_path)
     meta = load_model_meta(cfg.model_path) if model_ok else None
-    if conn is not None and cfg.ha_notify and not cfg.ha_dry_run:
-        rc |= _notify_hello(cfg, conn)
+    hello = conn is not None and bool(cfg.ha_notify) and not cfg.ha_dry_run
     for cam in cfg.cameras:
         snap, err = capture_snapshot(cam.url, cfg.snapshot_timeout_s, cfg.snapshot_source)
         if snap is None:
@@ -781,10 +841,15 @@ def poll_once(cfg: Config, dry_run: bool = False) -> int:
             rc = 1
             continue
         try:
+            if hello:  # the first good frame of the poll rides along
+                rc |= _notify_hello(cfg, conn, snap, cam.name)
+                hello = False
             rc |= _poll_camera(cfg, conn, cam, snap, model_ok, now, dry_run, meta)
         finally:
             # capture_snapshot used a temp file: remove it on every path.
             _remove(snap)
+    if hello:  # every camera failed: still say hello, without a photo
+        rc |= _notify_hello(cfg, conn)
     if conn is not None:
         conn.close()
     return rc
@@ -902,7 +967,7 @@ def _poll_camera(cfg: Config, conn: sqlite3.Connection | None, cam: Camera, snap
                 if changed:
                     log.info("camera %s: state %s -> %s, HA updated, evidence %s",
                              cam.name, old_present, new_present, ev)
-        rc |= _handle_notify(cfg, cam, s, changed, new_present, best, epoch)
+        rc |= _handle_notify(cfg, cam, s, changed, new_present, best, epoch, snap)
     save_state(conn, cam.name, s)
     conn.commit()
     return rc
@@ -940,6 +1005,9 @@ def cmd_check(cfg: Config) -> int:
         print(f"notify on arrival: {', '.join(cfg.ha_notify)} "
               f"(cooldown {cfg.ha_notify_cooldown_seconds}s)"
               + (" -- not sent while HA_DRY_RUN=1" if cfg.ha_dry_run else ""))
+        print("notify photo: " + (f"on (uploaded to HA /media/{NOTIFY_MEDIA_DIR}/; needs an "
+                                  "admin HA_TOKEN)" if cfg.ha_notify_image
+                                  else "off (HA_NOTIFY_IMAGE=0)"))
     else:
         print("notify: off (HA_NOTIFY unset; sensor only)")
     for cam in cfg.cameras:
