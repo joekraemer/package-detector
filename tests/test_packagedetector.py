@@ -382,12 +382,22 @@ class TestNotify(unittest.TestCase):
 
         def notify(cfg, payload):
             self.pushes.append(payload["title"])
+            self.payloads.append(payload)
             return self.push_err[0]
+
+        self.payloads = []
+        self.uploads = []
+        self.upload_result = [("/media/local/package-detector/x.jpg", "")]
+
+        def upload(cfg, snap, camera, when=None):
+            self.uploads.append((os.path.exists(snap), camera))
+            return self.upload_result[0]
 
         for name, fn in (("capture_snapshot", capture),
                          ("classify", lambda *a: self.p[0]),
                          ("post_to_ha", lambda *a: ""),
-                         ("notify_ha", notify)):
+                         ("notify_ha", notify),
+                         ("upload_notify_image", upload)):
             p = mock.patch.object(pd, name, side_effect=fn)
             p.start()
             self.addCleanup(p.stop)
@@ -505,6 +515,92 @@ class TestNotify(unittest.TestCase):
         self.assertIn("3:04 PM", p["message"])
         self.assertIn("0.97", p["message"])
         self.assertEqual(p["data"]["tag"], "package-doorbell")
+        self.assertNotIn("image", p["data"])
+        p = pd.notify_payload("doorbell", 0.9, image="/media/local/package-detector/a.jpg")
+        self.assertEqual(p["data"]["image"], "/media/local/package-detector/a.jpg")
+
+    def arrival_payloads(self):
+        return [p for p in self.payloads if p["title"].startswith("Package at")]
+
+    def test_arrival_push_carries_this_polls_frame(self):
+        self.poll(self.cfg(), 0.9, 2)
+        self.assertEqual(self.arrival_payloads()[0]["data"]["image"],
+                         "/media/local/package-detector/x.jpg")
+        # the hello and the arrival each uploaded a live (not yet deleted) frame
+        self.assertEqual(self.uploads, [(True, "doorbell"), (True, "doorbell")])
+        self.assertIn("image", self.payloads[0]["data"])               # hello too
+
+    def test_failed_upload_still_pushes_without_photo(self):
+        self.upload_result[0] = (None, "image upload failed: 401")
+        with self.assertLogs("packagedetector", "WARNING") as logs:
+            self.poll(self.cfg(), 0.9, 2)
+        self.assertEqual(self.arrivals(), ["Package at the doorbell"])
+        self.assertNotIn("image", self.arrival_payloads()[0]["data"])
+        self.assertTrue(any("without a photo" in l for l in logs.output))
+
+    def test_image_off(self):
+        self.poll(self.cfg(HA_NOTIFY_IMAGE="0"), 0.9, 2)
+        self.assertEqual(self.uploads, [])
+        self.assertEqual(len(self.arrivals()), 1)
+        self.assertNotIn("image", self.arrival_payloads()[0]["data"])
+        with self.assertRaises(ConfigError):
+            self.cfg(HA_NOTIFY_IMAGE="maybe")
+
+    def test_no_upload_during_cooldown(self):
+        cfg = self.cfg()
+        self.poll(cfg, 0.9, 2)
+        self.poll(cfg, 0.1, 2)
+        n = len(self.uploads)
+        self.poll(cfg, 0.9, 2)              # quiet arrival: nothing uploaded
+        self.assertEqual(len(self.uploads), n)
+
+
+class TestUploadNotifyImage(unittest.TestCase):
+    """upload_notify_image: the HA media-source upload call itself."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.dir)
+        self.snap = os.path.join(self.dir, "s.jpg")
+        with open(self.snap, "wb") as fh:
+            fh.write(b"\xff\xd8jpeg")
+        self.cfg = load_config({"CAMERAS": "doorbell=rtsp://a", "HA_URL": "http://ha:8123/",
+                                "HA_TOKEN": "tok"})
+
+    def test_upload_and_url(self):
+        from datetime import datetime as dt
+        resp = mock.Mock()
+        resp.json.return_value = {"media_content_id":
+                                  "media-source://media_source/local/package-detector/"
+                                  "doorbell_20261109_150405.jpg"}
+        with mock.patch("requests.post", return_value=resp) as post:
+            url, err = pd.upload_notify_image(self.cfg, self.snap, "doorbell",
+                                              dt(2026, 11, 9, 15, 4, 5))
+        self.assertEqual((url, err),
+                         ("/media/local/package-detector/doorbell_20261109_150405.jpg", ""))
+        args, kw = post.call_args
+        self.assertEqual(args[0], "http://ha:8123/api/media_source/local_source/upload")
+        self.assertEqual(kw["data"], {"media_content_id":
+                                      "media-source://media_source/local/package-detector"})
+        name, _, ctype = kw["files"]["file"]
+        self.assertEqual((name, ctype), ("doorbell_20261109_150405.jpg", "image/jpeg"))
+        self.assertEqual(kw["headers"], {"Authorization": "Bearer tok"})
+
+    def test_errors_never_raise_and_hide_the_token(self):
+        import requests
+        resp = mock.Mock()
+        resp.raise_for_status.side_effect = requests.HTTPError("401 Client Error: Unauthorized")
+        with mock.patch("requests.post", return_value=resp):
+            url, err = pd.upload_notify_image(self.cfg, self.snap, "doorbell")
+        self.assertIsNone(url)
+        self.assertIn("admin", err)
+        self.assertNotIn("tok", err)
+        resp = mock.Mock()
+        resp.json.return_value = {"media_content_id": "media-source://other/x.jpg"}
+        with mock.patch("requests.post", return_value=resp):
+            url, err = pd.upload_notify_image(self.cfg, self.snap, "doorbell")
+        self.assertIsNone(url)
+        self.assertIn("unexpected", err)
 
 
 class TestUncertainFrames(unittest.TestCase):
