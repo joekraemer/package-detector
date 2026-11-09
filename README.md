@@ -161,6 +161,7 @@ the exit code.
 | `HA_REFRESH_SECONDS` | `300` | re-send each sensor's current state this often (60..3600), plus after any failed POST |
 | `HA_NOTIFY` | (unset = no pushes) | Home Assistant notify services to call when a package **arrives**, comma separated, e.g. `notify.mobile_app_joes_iphone`. One push per arrival; a failed push is retried while the package is still there. Not sent while `HA_DRY_RUN=1` (logged as "would notify" instead). The first live poll with a new `HA_NOTIFY` value sends one "Package alerts are on" push, so you know the path works |
 | `HA_NOTIFY_IMAGE` | `1` | attach the camera frame that confirmed the package to each push (and to the "alerts are on" push). Uploaded to HA's media folder (`/media/package-detector/` on the HA host), so `HA_TOKEN` must belong to an admin user. A failed upload is logged and the push goes out without the photo. `0` = text only |
+| `CAMERA_ENTITIES` | (unset) | camera name to its Home Assistant camera entity, comma separated, e.g. `doorbell=camera.doorbell_fluent`. Tapping that camera's push opens the entity's live view in the HA app (`url` on iOS, `clickAction` on Android). Unset = tapping just opens the app |
 | `HA_NOTIFY_COOLDOWN_SECONDS` | `1800` | after a push, the same camera's next arrival within this many seconds stays quiet (0..86400, 0 = no cooldown), so a package flickering in and out can't spam the phone |
 | `DATA_DIR` | `/data` | SQLite db + evidence snapshots |
 | `SNAPSHOT_TIMEOUT_S` | `15` | snapshot timeout per camera |
@@ -243,7 +244,9 @@ POST {HA_URL}/api/services/notify/<name>
 {"title": "Package at the doorbell",
  "message": "A package showed up at the doorbell at 3:04 PM (confidence 0.97).",
  "data": {"tag": "package-doorbell",
-          "image": "/media/local/package-detector/doorbell_20261109_150405.jpg"}}
+          "image": "/media/local/package-detector/doorbell_20261109_150405.jpg",
+          "url": "/?more-info-entity-id=camera.doorbell_fluent",
+          "clickAction": "/?more-info-entity-id=camera.doorbell_fluent"}}
 ```
 
 - The photo is the camera frame from the poll that confirmed the package.

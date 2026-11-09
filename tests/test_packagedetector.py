@@ -538,6 +538,29 @@ class TestNotify(unittest.TestCase):
         self.assertNotIn("image", self.arrival_payloads()[0]["data"])
         self.assertTrue(any("without a photo" in l for l in logs.output))
 
+    def test_tap_opens_the_camera(self):
+        self.poll(self.cfg(CAMERA_ENTITIES="doorbell=camera.doorbell_fluent"), 0.9, 2)
+        link = "/?more-info-entity-id=camera.doorbell_fluent"
+        for p in self.payloads:                       # hello and arrival
+            self.assertEqual((p["data"]["url"], p["data"]["clickAction"]), (link, link))
+
+    def test_tap_unset_adds_no_link(self):
+        self.poll(self.cfg(), 0.9, 2)
+        self.assertTrue(self.payloads)
+        for p in self.payloads:
+            self.assertNotIn("url", p["data"])
+            self.assertNotIn("clickAction", p["data"])
+
+    def test_camera_entities_parse(self):
+        cams = pd.parse_cameras("doorbell=rtsp://a,porch=rtsp://b")
+        self.assertEqual(pd.parse_camera_entities(" doorbell=camera.d_1 ,porch=camera.p", cams),
+                         {"doorbell": "camera.d_1", "porch": "camera.p"})
+        self.assertEqual(pd.parse_camera_entities("", cams), {})
+        for bad in ("garage=camera.g", "doorbell=light.x", "doorbell=camera.a&b=1",
+                    "doorbell"):
+            with self.assertRaises(ConfigError):
+                pd.parse_camera_entities(bad, cams)
+
     def test_image_off(self):
         self.poll(self.cfg(HA_NOTIFY_IMAGE="0"), 0.9, 2)
         self.assertEqual(self.uploads, [])

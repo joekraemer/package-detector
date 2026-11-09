@@ -98,6 +98,9 @@ class Config:
     # (needs an admin HA_TOKEN), sent as data.image. A failed upload still
     # sends the push, just without the photo.
     ha_notify_image: bool = True
+    # Camera name -> HA camera entity, e.g. {"doorbell": "camera.doorbell_fluent"}.
+    # Tapping that camera's push opens the entity's live view in the HA app.
+    camera_entities: dict[str, str] = field(default_factory=dict)
     # "ffmpeg" (RTSP grab) or "reolink" (Snap API, ffmpeg as fallback).
     snapshot_source: str = "ffmpeg"
     # Frames the classifier is unsure about are the most useful training
@@ -235,6 +238,27 @@ def parse_notify(value: str) -> list[str]:
     return out
 
 
+CAMERA_ENTITY_RE = re.compile(r"^camera\.[a-z0-9_]+$")
+
+
+def parse_camera_entities(value: str, cameras: list[Camera]) -> dict[str, str]:
+    """`doorbell=camera.doorbell_fluent,porch=camera.porch`. Goes into a
+    URL the phone opens, so entity ids are strict."""
+    names = {c.name for c in cameras}
+    out: dict[str, str] = {}
+    for part in value.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        name, _, entity = (p.strip() for p in part.partition("="))
+        if name not in names:
+            raise ConfigError(f"CAMERA_ENTITIES names unknown camera: {name!r}")
+        if not CAMERA_ENTITY_RE.match(entity):
+            raise ConfigError(f"CAMERA_ENTITIES: {name} must map to camera.xxx, got {entity!r}")
+        out[name] = entity
+    return out
+
+
 def load_config(env: dict | None = None, require_ha: bool = False) -> Config:
     env = dict(os.environ) if env is None else env
     cameras = parse_cameras(env.get("CAMERAS", ""))
@@ -260,6 +284,7 @@ def load_config(env: dict | None = None, require_ha: bool = False) -> Config:
         ha_notify_cooldown_seconds=_env_int(env, "HA_NOTIFY_COOLDOWN_SECONDS", 1800, 0, 86400),
         ha_notify_test=_env_token(env, "HA_NOTIFY_TEST"),
         ha_notify_image=_env_bool(env, "HA_NOTIFY_IMAGE", default=True),
+        camera_entities=parse_camera_entities(env.get("CAMERA_ENTITIES", ""), cameras),
         snapshot_source=_env_source(env),
         uncertain_low=_env_float(env, "UNCERTAIN_LOW", 0.4),
         uncertain_high=_env_float(env, "UNCERTAIN_HIGH", 0.8),
@@ -687,8 +712,15 @@ def post_to_ha(cfg: Config, camera: str, present: bool,
     return ""
 
 
+def _tap_to_camera(data: dict, entity: str | None) -> None:
+    """Tapping the push opens the camera's more-info view (live stream) in
+    the HA app: `url` on iOS, `clickAction` on Android."""
+    if entity:
+        data["url"] = data["clickAction"] = f"/?more-info-entity-id={entity}"
+
+
 def notify_payload(camera: str, confidence: float | None, when: datetime | None = None,
-                   image: str | None = None) -> dict:
+                   image: str | None = None, camera_entity: str | None = None) -> dict:
     when = when or datetime.now()
     at = when.strftime("%I:%M %p").lstrip("0")
     place = camera.replace("_", " ")
@@ -697,6 +729,7 @@ def notify_payload(camera: str, confidence: float | None, when: datetime | None 
     data: dict = {"tag": f"package-{camera}"}
     if image:
         data["image"] = image
+    _tap_to_camera(data, camera_entity)
     return {"title": f"Package at the {place}",
             "message": f"A package showed up at the {place} at {at}{conf}.",
             "data": data}
@@ -780,6 +813,7 @@ def _notify_hello(cfg: Config, conn: sqlite3.Connection, snap: str | None = None
     image = _notify_image(cfg, snap, camera or "hello")
     if image:
         data["image"] = image
+    _tap_to_camera(data, cfg.camera_entities.get(camera or ""))
     err = notify_ha(cfg, {"title": "Package alerts are on",
                           "message": f"You'll get a notification when a package shows up ({cams}).",
                           "data": data})
@@ -810,7 +844,8 @@ def _handle_notify(cfg: Config, cam: Camera, s: CamState, changed: bool, present
         s.notify_pending = False
         return 0
     image = _notify_image(cfg, snap, cam.name)
-    err = notify_ha(cfg, notify_payload(cam.name, confidence, image=image))
+    err = notify_ha(cfg, notify_payload(cam.name, confidence, image=image,
+                                        camera_entity=cfg.camera_entities.get(cam.name)))
     if err:
         log.error("camera %s: HA notify failed: %s (will retry next poll)", cam.name, err)
         return 1
@@ -1008,6 +1043,10 @@ def cmd_check(cfg: Config) -> int:
         print("notify photo: " + (f"on (uploaded to HA /media/{NOTIFY_MEDIA_DIR}/; needs an "
                                   "admin HA_TOKEN)" if cfg.ha_notify_image
                                   else "off (HA_NOTIFY_IMAGE=0)"))
+        for cam in cfg.cameras:
+            entity = cfg.camera_entities.get(cam.name)
+            print(f"notify tap {cam.name}: " + (f"opens {entity}" if entity
+                                                else "opens the app (CAMERA_ENTITIES unset)"))
     else:
         print("notify: off (HA_NOTIFY unset; sensor only)")
     for cam in cfg.cameras:
