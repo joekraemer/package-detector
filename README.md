@@ -153,6 +153,7 @@ the exit code.
 | `MODEL_PATH` | `/models/package.onnx` | ONNX model, mounted, not committed. If a `<model>.json` sidecar from `train.py` sits next to it (e.g. `package-cls.onnx` + `package-cls.json`), it is the **zone classifier**: each camera listed in the sidecar is classified on its zone crop, and `CONFIDENCE` is the p(package) bar. Without a sidecar it is treated as the older YOLO box detector |
 | `HA_DRY_RUN` | `0` | `1` = shadow mode: full loop (state machine, SQLite, evidence on changes) but Home Assistant is never called; state changes are only logged. `HA_URL`/`HA_TOKEN` not required |
 | `CONFIDENCE` | `0.5` | detection confidence bar, 0..1. Start here, tune from evidence (see Tuning) |
+| `NOTIFY_CONFIDENCE` | `CONFIDENCE` | push bar, 0..1. The sensor, evidence and uncertain frames follow `CONFIDENCE`; an `HA_NOTIFY` push waits until `CONFIRM_HITS` consecutive polls reach this. An arrival that never does changes the sensor but sends no push. Values below `CONFIDENCE` add no gate |
 | `CONFIRM_HITS` | `2` | consecutive polls with a detection before a camera flips to present (~30 s at 15 s polls) |
 | `CLEAR_MISSES` | `5` | consecutive polls without one before a camera flips to absent (~75 s at 15 s polls — a single dark/occluded frame must not clear a real package) |
 | `ZONES` | (unset = full frame) | per-camera rectangle, `porch=0,0.5,1,1` = x_min,y_min,x_max,y_max as fractions of the frame. Only detections whose centre falls inside count |
@@ -256,7 +257,10 @@ POST {HA_URL}/api/services/notify/<name>
   companion app downloads `/media/local/...` with its own login, so the
   photo is not public. Frames are ~50 KB and are not deleted
   automatically; clear the folder from HA's Media browser now and then.
-- One push per arrival, only after `CONFIRM_HITS` polls. A failed push is
+- One push per arrival, only after `CONFIRM_HITS` polls at or above
+  `NOTIFY_CONFIDENCE` (default: `CONFIDENCE`). A replay of the live v4
+  polls from Nov 7-12 at 0.9 kept all 3 caught deliveries and cut the
+  false-alarm pushes from 31 to 7. A failed push is
   retried while the package is still there and dropped once it's gone.
 - `HA_NOTIFY_COOLDOWN_SECONDS` (30 min) keeps a flickering package quiet.
 - The first live poll with a new `HA_NOTIFY` value sends one "Package
