@@ -456,9 +456,40 @@ class TestNotify(unittest.TestCase):
     def test_weak_arrival_that_leaves_is_never_pushed(self):
         cfg = self.cfg(NOTIFY_CONFIDENCE="0.9")
         self.poll(cfg, 0.7, 3)              # false alarm at 0.7
-        self.poll(cfg, 0.1, 2)              # cleared
-        self.poll(cfg, 0.95, 1)             # one strong poll on a new arrival: not confirmed
+        self.poll(cfg, 0.1, 2)              # cleared before it ever got strong
+        self.poll(cfg, 0.95, 1)             # a strong poll after it left: nothing stale sent
         self.assertEqual(self.arrivals(), [])
+
+    def test_failed_push_retries_without_a_new_strong_streak(self):
+        cfg = self.cfg(NOTIFY_CONFIDENCE="0.9")
+        self.poll(cfg, 0.1)                 # hello
+        self.push_err[0] = "down"
+        self.poll(cfg, 0.95, 2)             # strong arrival, push fails
+        self.push_err[0] = ""
+        self.poll(cfg, 0.7)                 # still present but weak: retry goes out
+        self.assertEqual(self.arrivals(), ["Package at the doorbell"] * 2)  # 1 failed + 1 sent
+        self.poll(cfg, 0.95, 3)
+        self.assertEqual(len(self.arrivals()), 2)
+
+    def test_unrounded_score_counts_as_strong(self):
+        cfg = self.cfg(CONFIDENCE="0.4561")
+        self.poll(cfg, 0.4562, 2)           # rounds to 0.456 < 0.4561, still detected
+        self.assertEqual(self.arrivals(), ["Package at the doorbell"])
+
+    def test_db_from_before_the_push_bar_migrates(self):
+        import sqlite3
+        conn = sqlite3.connect(os.path.join(self.dir, "package-detector.sqlite"))
+        conn.execute("""CREATE TABLE camera_state (camera TEXT PRIMARY KEY, present INTEGER,
+                        hits INTEGER, misses INTEGER, last_seen TEXT, since TEXT,
+                        ha_synced INTEGER DEFAULT 0, ha_posted REAL,
+                        notify_pending INTEGER DEFAULT 0, notified REAL)""")
+        conn.execute("INSERT INTO camera_state VALUES ('doorbell',1,3,0,NULL,NULL,1,NULL,1,NULL)")
+        conn.commit()
+        conn.close()
+        conn = pd.init_db(self.dir)
+        s = pd.load_state(conn, "doorbell")
+        conn.close()
+        self.assertEqual((s.strong_hits, s.notify_armed), (3, True))  # a retry stays ready
 
     def test_notify_confidence_defaults_to_confidence(self):
         self.assertEqual(self.cfg(CONFIDENCE="0.6").notify_confidence, 0.6)
