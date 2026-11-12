@@ -74,6 +74,10 @@ class Config:
     poll_interval_seconds: int = 15
     model_path: str = "/models/package.onnx"
     confidence: float = 0.5
+    # The push bar: an arrival notifies only once CONFIRM_HITS consecutive
+    # polls score at least this. The sensor, evidence and uncertain frames
+    # still follow `confidence`. Defaults to `confidence` (no extra gate).
+    notify_confidence: float = 0.5
     confirm_hits: int = 2
     clear_misses: int = 5
     zones: dict[str, tuple[float, float, float, float]] = field(default_factory=dict)
@@ -271,6 +275,7 @@ def load_config(env: dict | None = None, require_ha: bool = False) -> Config:
         poll_interval_seconds=_env_int(env, "POLL_INTERVAL_SECONDS", 15, 15, 900),
         model_path=env.get("MODEL_PATH", "/models/package.onnx"),
         confidence=_env_float(env, "CONFIDENCE", 0.5),
+        notify_confidence=_env_float(env, "NOTIFY_CONFIDENCE", _env_float(env, "CONFIDENCE", 0.5)),
         confirm_hits=_env_int(env, "CONFIRM_HITS", 2, 1, 10),
         clear_misses=_env_int(env, "CLEAR_MISSES", 5, 1, 10),
         zones=zones,
@@ -641,6 +646,9 @@ def init_db(data_dir: str) -> sqlite3.Connection:
         conn.execute("ALTER TABLE camera_state ADD COLUMN notify_pending INTEGER DEFAULT 0")
     if "notified" not in cols:
         conn.execute("ALTER TABLE camera_state ADD COLUMN notified REAL")
+    # strong_hits: consecutive polls at or above NOTIFY_CONFIDENCE.
+    if "strong_hits" not in cols:
+        conn.execute("ALTER TABLE camera_state ADD COLUMN strong_hits INTEGER DEFAULT 0")
     conn.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)")
     conn.commit()
     return conn
@@ -657,25 +665,27 @@ class CamState:
     ha_posted: float | None = None
     notify_pending: bool = False
     notified: float | None = None
+    strong_hits: int = 0           # consecutive polls >= notify_confidence
 
 
 def load_state(conn: sqlite3.Connection, camera: str) -> CamState:
     row = conn.execute("""SELECT present, hits, misses, last_seen, since, ha_synced, ha_posted,
-                                 notify_pending, notified
+                                 notify_pending, notified, strong_hits
                           FROM camera_state WHERE camera=?""", (camera,)).fetchone()
     if not row:
         return CamState()
     return CamState(bool(row[0]), row[1], row[2], row[3], row[4], bool(row[5]), row[6],
-                    bool(row[7]), row[8])
+                    bool(row[7]), row[8], row[9] or 0)
 
 
 def save_state(conn: sqlite3.Connection, camera: str, s: CamState) -> None:
     conn.execute("""INSERT OR REPLACE INTO camera_state
                     (camera, present, hits, misses, last_seen, since, ha_synced, ha_posted,
-                     notify_pending, notified)
-                    VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                     notify_pending, notified, strong_hits)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
                  (camera, int(s.present), s.hits, s.misses, s.last_seen, s.since,
-                  int(s.ha_synced), s.ha_posted, int(s.notify_pending), s.notified))
+                  int(s.ha_synced), s.ha_posted, int(s.notify_pending), s.notified,
+                  s.strong_hits))
 
 
 def needs_ha_post(changed: bool, synced: bool, last_post: float | None, now: float,
@@ -830,12 +840,19 @@ def _handle_notify(cfg: Config, cam: Camera, s: CamState, changed: bool, present
                    confidence: float | None, epoch: float, snap: str | None = None) -> int:
     """Arrival -> one notification, with this poll's frame attached. Leaving
     clears a notification that has not gone out yet; a failed one is retried
-    while the package is there (with that later poll's frame)."""
+    while the package is there (with that later poll's frame). The push waits
+    until CONFIRM_HITS consecutive polls reach NOTIFY_CONFIDENCE; an arrival
+    that never does stays a sensor-only state change and is never pushed."""
     if changed and present:
         s.notify_pending = True
     if not present:
         s.notify_pending = False
     if not (s.notify_pending and cfg.ha_notify):
+        return 0
+    if s.strong_hits < cfg.confirm_hits:
+        if changed:
+            log.info("camera %s: present, but below NOTIFY_CONFIDENCE %.2f; push waits",
+                     cam.name, cfg.notify_confidence)
         return 0
     if (s.notified is not None and cfg.ha_notify_cooldown_seconds
             and epoch - s.notified < cfg.ha_notify_cooldown_seconds):
@@ -966,6 +983,8 @@ def _poll_camera(cfg: Config, conn: sqlite3.Connection | None, cam: Camera, snap
     new_present, s.hits, s.misses, changed = update_state(
         s.present, s.hits, s.misses, detected, cfg.confirm_hits, cfg.clear_misses)
     old_present, s.present = s.present, new_present
+    strong = detected and best is not None and best >= cfg.notify_confidence
+    s.strong_hits = s.strong_hits + 1 if strong else 0
     if detected:
         s.last_seen = now
     if changed or s.since is None:
@@ -988,8 +1007,9 @@ def _poll_camera(cfg: Config, conn: sqlite3.Connection | None, cam: Camera, snap
             log.info("camera %s: state %s -> %s (HA_DRY_RUN: Home Assistant not updated), "
                      "evidence %s", cam.name, old_present, new_present, ev)
             if new_present and cfg.ha_notify:
-                log.info("camera %s: HA_DRY_RUN: would notify %s",
-                         cam.name, ",".join(cfg.ha_notify))
+                log.info("camera %s: HA_DRY_RUN: would notify %s once %d polls reach %.2f",
+                         cam.name, ",".join(cfg.ha_notify), cfg.confirm_hits,
+                         cfg.notify_confidence)
     else:
         if needs_ha_post(changed, s.ha_synced, s.ha_posted, epoch, cfg.ha_refresh_seconds):
             err = post_to_ha(cfg, cam.name, new_present, best, s.last_seen)
@@ -1012,7 +1032,8 @@ def cmd_check(cfg: Config) -> int:
     """Config + ffmpeg + model presence + one snapshot per camera. No writes."""
     problems = []
     print(f"config: {len(cfg.cameras)} camera(s), poll {cfg.poll_interval_seconds}s, "
-          f"confidence {cfg.confidence}, confirm {cfg.confirm_hits}, clear {cfg.clear_misses}")
+          f"confidence {cfg.confidence}, notify at {cfg.notify_confidence}, "
+          f"confirm {cfg.confirm_hits}, clear {cfg.clear_misses}")
     for cam in cfg.cameras:
         if "_main" in cam.url or "Preview_01_main" in cam.url or "h264Preview_01_main" in cam.url:
             print(f"hint: {cam.name} uses a main-stream URL; use the sub-stream")

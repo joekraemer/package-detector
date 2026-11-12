@@ -433,6 +433,38 @@ class TestNotify(unittest.TestCase):
             with self.assertRaises(ConfigError):
                 pd.parse_notify(bad)
 
+    def test_notify_confidence_gates_the_push_not_the_sensor(self):
+        cfg = self.cfg(NOTIFY_CONFIDENCE="0.9")
+        self.assertEqual((cfg.confidence, cfg.notify_confidence), (0.5, 0.9))
+        self.poll(cfg, 0.7, 4)              # present at 0.5, never strong: no push
+        conn = pd.init_db(self.dir)
+        self.assertTrue(pd.load_state(conn, "doorbell").present)
+        conn.close()
+        self.assertEqual(self.arrivals(), [])
+        self.poll(cfg, 0.95)                # one strong poll: still waits
+        self.assertEqual(self.arrivals(), [])
+        self.poll(cfg, 0.95)                # two in a row: the same arrival pushes once
+        self.poll(cfg, 0.95, 3)
+        self.assertEqual(self.arrivals(), ["Package at the doorbell"])
+
+    def test_strong_polls_must_be_consecutive(self):
+        cfg = self.cfg(NOTIFY_CONFIDENCE="0.9")
+        for p in (0.95, 0.7, 0.95, 0.7, 0.95, 0.7):
+            self.poll(cfg, p)
+        self.assertEqual(self.arrivals(), [])
+
+    def test_weak_arrival_that_leaves_is_never_pushed(self):
+        cfg = self.cfg(NOTIFY_CONFIDENCE="0.9")
+        self.poll(cfg, 0.7, 3)              # false alarm at 0.7
+        self.poll(cfg, 0.1, 2)              # cleared
+        self.poll(cfg, 0.95, 1)             # one strong poll on a new arrival: not confirmed
+        self.assertEqual(self.arrivals(), [])
+
+    def test_notify_confidence_defaults_to_confidence(self):
+        self.assertEqual(self.cfg(CONFIDENCE="0.6").notify_confidence, 0.6)
+        with self.assertRaises(ConfigError):
+            self.cfg(NOTIFY_CONFIDENCE="1.5")
+
     def test_one_push_per_arrival_after_confirmation(self):
         cfg = self.cfg()
         self.poll(cfg, 0.1, 2)
