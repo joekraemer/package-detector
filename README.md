@@ -316,6 +316,66 @@ be ignored, which is worse than no sensor. The `--dry-run` + evidence
 review loop is how you get there: run, look at the evidence, label the
 mistakes, retrain, repeat.
 
+### Parked idea: a local vision model as a second opinion
+
+Tested 2026-11-13, not deployed. `NOTIFY_CONFIDENCE=0.9` keeps the HA
+sensor sensitive but silences pushes for real deliveries the classifier
+scores 0.5-0.9. The question was whether a small local vision model
+(Ollama) could look at those frames and decide, so the push goes out
+when `p >= 0.9`, **or** `0.5 <= p < 0.9` and the vision model says yes.
+
+Method: 81 labelled doorbell zone crops (29 package, 52 empty), temperature
+0, one question per image, first word of the answer parsed as yes/no:
+
+> This is a crop of a front porch from a doorbell camera. Is there a
+> package, parcel, box, padded mailer or delivery bag visible in this
+> image? Answer with only one word: yes or no.
+
+- **Held-out days** (the test days in `package-data/frames/test_days.json`).
+- **Gray zone**: every labelled package the classifier (db-v4) scored
+  0.5-0.9, plus a sample of empties it scored 0.5 or higher. The 0.9
+  bar therefore catches 0/17 packages here by construction.
+
+| | gray-zone packages caught | gray-zone empties called "yes" | held-out packages caught | held-out empties called "yes" |
+|---|---|---|---|---|
+| db-v4 at 0.9 (the push bar) | 0/17 | 1/20 | 10/11 | 0/28 |
+| **Gemma 3 4B** | 16/17 | 5/20 | 11/11 | 5/28 |
+| Gemma 3 4B as the gate above | 16/17 | 6/20 | 10/11 | 1/28 |
+| Qwen2.5-VL 3B | 8/17 | 2/22 | 9/10 | 1/30 |
+
+moondream returned empty answers for every image.
+
+**Gemma 3 4B is good out of the box**: no prompt tuning or fine-tuning,
+and it catches nearly every package the 0.9 bar silences. Its weakness
+is false "yes" answers on gray-zone empties (about 1 in 4), which would
+each be a push. Some of these may be carried items, which the labelling
+rule here counts as empty; the prompt does not exclude them and the
+misses were not examined one by one. Most gray-zone packages are staged
+capture sessions, not real deliveries, so treat the table as a rough
+guide.
+
+**Why it is parked: speed.** On the fleet MacBook (Intel, 2 cores, no
+usable GPU, Ollama in a container capped at 1.5 CPUs and 5 GB, since
+macOS 13 cannot run current Ollama natively) Gemma takes about 108 s per
+image and Qwen about 150 s. That is too slow and heavy to share the host
+with the other fleet services. On hardware with a GPU it would be
+seconds.
+
+**If the home server is ever upgraded** (for example the planned
+always-on box with a GPU), this is worth redoing with Gemma 3 4B as the
+starting point:
+
+1. Tune the prompt to ignore items carried by a person, then re-run the
+   same 81 frames and check the gray-zone false "yes" rate.
+2. Gate only frames in the 0.5-0.9 band, so the vision model runs a few
+   times a day, not every poll.
+3. Wire it in either with the Home Assistant
+   [LLM Vision](https://github.com/valentinfrlch/ha-llmvision)
+   integration or by calling Ollama from `loop.py` before the push.
+
+The test scripts were not committed; the prompt, settings and frame
+selection above are enough to repeat it.
+
 ## Deploy
 
 `.github/workflows/build.yml` is intended to mirror birdlisten's: on
