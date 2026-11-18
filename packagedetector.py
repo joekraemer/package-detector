@@ -343,6 +343,9 @@ def update_state(present: bool, hits: int, misses: int, detected: bool,
 
 SNAPSHOT_SOURCES = ("ffmpeg", "reolink")
 SNAP_WIDTH = 640  # the sub-stream width every training frame so far has
+# ffmpeg filter for the RTSP fallback: down to SNAP_WIDTH (aspect kept, even
+# height), never up. A sub-stream frame passes through unchanged.
+SNAP_SCALE = f"scale='min({SNAP_WIDTH},iw)':-2"
 _REOLINK_CHANNEL_RE = re.compile(r"Preview_(\d+)_")
 
 
@@ -422,13 +425,17 @@ def _warn_snap_fallback(url: str, err: str) -> None:
 
 
 def _ffmpeg_snapshot(url: str, timeout_s: int) -> tuple[str | None, str]:
-    """One frame via ffmpeg from the RTSP sub-stream."""
+    """One frame via ffmpeg from the camera's RTSP stream, scaled down to
+    SNAP_WIDTH like the Snap API path, so a main-stream URL (the doorbell's
+    sub-stream has returned 404 since 2026-11-15) still yields frames the
+    size the model was trained on. A sub-stream frame is left as it is."""
     if shutil.which("ffmpeg") is None:
         return None, "ffmpeg not found"
     tmp = tempfile.NamedTemporaryFile(suffix=".jpg", delete=False)
     tmp.close()
     cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error",
            "-rtsp_transport", "tcp", "-i", url,
+           "-vf", SNAP_SCALE,
            "-frames:v", "1", "-q:v", "2", "-y", tmp.name]
     err = ""
     try:

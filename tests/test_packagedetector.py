@@ -6,6 +6,7 @@ import io
 import json
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 import time
@@ -807,6 +808,43 @@ class TestReolinkSnapshot(unittest.TestCase):
                          .snapshot_source, "reolink")
         with self.assertRaises(ConfigError):
             load_config({"CAMERAS": "a=rtsp://x", "SNAPSHOT_SOURCE": "http"})
+
+
+class TestFfmpegFallbackSize(unittest.TestCase):
+    """The RTSP fallback scales to SNAP_WIDTH like the Snap path, so a
+    main-stream URL still gives the model training-size frames."""
+
+    def test_command_scales_after_the_input(self):
+        with tempfile.TemporaryDirectory() as d:
+            log_path = os.path.join(d, "argv")
+            fake = os.path.join(d, "ffmpeg")
+            with open(fake, "w") as f:
+                f.write(f'#!/bin/sh\nprintf "%s\\n" "$@" > "{log_path}"\n'
+                        'for a; do last=$a; done\nprintf x > "$last"\n')
+            os.chmod(fake, 0o755)
+            with mock.patch.dict(os.environ, {"PATH": d + os.pathsep + os.environ["PATH"]}):
+                snap, err = pd._ffmpeg_snapshot("rtsp://h/Preview_01_main", 5)
+            with open(log_path) as f:
+                argv = f.read().splitlines()
+        self.assertEqual(err, "")
+        os.remove(snap)
+        i = argv.index("-vf")
+        self.assertEqual(argv[i + 1], pd.SNAP_SCALE)
+        self.assertGreater(i, argv.index("-i"))           # an output option, after the input
+        self.assertLess(i, argv.index("-frames:v"))
+
+    def test_filter_downscales_main_and_keeps_sub(self):
+        if shutil.which("ffmpeg") is None:
+            self.skipTest("needs ffmpeg (CI runs the tests in the image, which has it)")
+        from PIL import Image
+        with tempfile.TemporaryDirectory() as d:
+            for size, want in (("2560x1920", (640, 480)), ("640x480", (640, 480)), ("320x240", (320, 240))):
+                out = os.path.join(d, f"{size}.jpg")
+                subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-f", "lavfi",
+                                "-i", f"testsrc=size={size}:rate=1", "-vf", pd.SNAP_SCALE,
+                                "-frames:v", "1", "-y", out], check=True, timeout=30)
+                with Image.open(out) as im:
+                    self.assertEqual(im.size, want, size)
 
 
 class TestClassifierInput(unittest.TestCase):
